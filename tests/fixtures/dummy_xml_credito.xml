@@ -1,0 +1,99 @@
+<?xml version="1.0" encoding="utf-8"?>
+<cfdi:Comprobante 
+    Version="4.0" 
+    Folio="000000000000" 
+    Fecha="2026-01-16T00:00:00" 
+    Sello="DUMMY_SELLO_COMPLETO_002" 
+    FormaPago="03" 
+    NoCertificado="0000000000000000" 
+    Certificado="DUMMY_CERTIFICADO_DATA_002" 
+    SubTotal="100.00" 
+    Descuento="0.00" 
+    Moneda="MXN" 
+    TipoCambio="1" 
+    Total="100.00" 
+    TipoDeComprobante="I" 
+    Exportacion="01" 
+    MetodoPago="PUE" 
+    LugarExpedicion="00000" 
+    xmlns:cfdi="http://www.sat.gob.mx/cfd/4" 
+    xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" 
+    xsi:schemaLocation="http://www.sat.gob.mx/cfd/4 http://www.sat.gob.mx/sitio_internet/cfd/4/cfdv40.xsd">
+    
+    <cfdi:Emisor 
+        Rfc="ABC123456789" 
+        Nombre="BANCO DUMMY S.A. DE C.V." 
+        RegimenFiscal="601" />
+    
+    <cfdi:Receptor 
+        Rfc="XYZ987654321" 
+        Nombre="JUAN PEREZ TEST" 
+        DomicilioFiscalReceptor="00000" 
+        RegimenFiscalReceptor="616" 
+        UsoCFDI="S01" />
+    
+    <cfdi:Conceptos>
+        <cfdi:Concepto 
+            ClaveProdServ="99999999" 
+            Cantidad="1" 
+            ClaveUnidad="E48" 
+            Unidad="Unidad de servicio" 
+            Descripcion="Servicio de Prueba" 
+            ValorUnitario="100.00" 
+            Importe="100.00" 
+            Descuento="0.00" 
+            ObjetoImp="01" />
+    </cfdi:Conceptos>
+    
+    <cfdi:Complemento>
+        <tfd:TimbreFiscalDigital 
+            xmlns:tfd="http://www.sat.gob.mx/TimbreFiscalDigital" 
+            xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" 
+            xsi:schemaLocation="http://www.sat.gob.mx/TimbreFiscalDigital http://www.sat.gob.mx/sitio_internet/cfd/TimbreFiscalDigital/TimbreFiscalDigitalv11.xsd" 
+            Version="1.1" 
+            UUID="00000000-0000-0000-0000-000000000000" 
+            FechaTimbrado="2026-01-16T00:00:00" 
+            RfcProvCertif="CERT123456789" 
+            SelloCFD="DUMMY_SELLO_CFD_DATA" 
+            NoCertificadoSAT="0000000000000000" 
+            SelloSAT="DUMMY_SELLO_SAT_DATA" />
+    </cfdi:Complemento>
+    
+    <cfdi:Addenda>
+        <DG:DatosGenerales 
+            xmlns:DG="http://www.hsbc.com.mx/schema/DG" 
+            version="1.0" 
+            numerodecuenta="000000000000" 
+            nombredelCliente="JUAN PEREZ TEST" 
+            periodo="16 Dic 25 - 15 Ene 26">
+            <DG:Movimientos>
+                <!-- Movimientos estándar -->
+                <DG:MovimientosDelCliente 
+                    fecha="2025-12-16T12:00:00" 
+                    descripcion="PAGO DE PRUEBA 1" 
+                    importe="35000.00" />
+                <DG:MovimientosDelCliente 
+                    fecha="2025-12-16T12:00:00" 
+                    descripcion="PAGO DE PRUEBA 2" 
+                    importe="4000.00" />
+                
+                <!-- Movimientos Fiscales (Diferencia importante con el XML 1) -->
+                <DG:MovimientoDelClienteFiscal 
+                    fecha="2025-12-15T12:00:00" 
+                    descripcion="MOVIMIENTO FISCAL 1" 
+                    RFCenajenante="RFC_TEST_001" 
+                    importe="755.00" />
+                <DG:MovimientoDelClienteFiscal 
+                    fecha="2025-12-15T12:00:00" 
+                    descripcion="MOVIMIENTO FISCAL 2" 
+                    RFCenajenante="RFC_TEST_002" 
+                    importe="1497.68" />
+                <DG:MovimientoDelClienteFiscal 
+                    fecha="2025-12-17T12:00:00" 
+                    descripcion="MOVIMIENTO FISCAL 3" 
+                    RFCenajenante="RFC_TEST_003" 
+                    importe="1500.00" />
+            </DG:Movimientos>
+        </DG:DatosGenerales>
+    </cfdi:Addenda>
+</cfdi:Comprobante>

@@ -1,0 +1,47 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+*/__pycache__/
+
+# Virtual Environment
+.venv/
+venv/
+ENV/
+env/
+
+# Local databases, checkpoints and stored financial documents (Privacy & Security)
+data/
+*.db
+*.db-wal
+*.db-shm
+*.sqlite
+checkpoint_active.json
+*.jsonl
+
+# Test caches & coverage
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Environment and secrets
+.env
+.env.*
+secrets.toml
+*.pem
+*.key
+
+# Temporary files & logs
+*.log
+temp/
+tmp/
+*.tmp
+
+# IDE & Editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
