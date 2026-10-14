@@ -74,12 +74,14 @@ def detect_pdf_profile(
 
         avg_chars = sum(char_counts) / max(total_pages, 1)
         is_digital = avg_chars >= char_threshold_per_page
+        has_scanned = any(c < char_threshold_per_page for c in char_counts)
 
         return {
             "page_count": total_pages,
             "char_counts": char_counts,
             "avg_chars_per_page": round(avg_chars, 1),
             "is_digital_native": is_digital,
+            "has_scanned_pages": has_scanned,
             "recommended_mode": "digital" if is_digital else "ocr",
         }
     except Exception as ex:
@@ -89,9 +91,11 @@ def detect_pdf_profile(
             "char_counts": [0],
             "avg_chars_per_page": 0.0,
             "is_digital_native": False,
+            "has_scanned_pages": True,
             "recommended_mode": "ocr",
             "warning": str(ex),
         }
+
 
 
 def render_pdf_page_image(
@@ -212,21 +216,28 @@ def parse_pdf(
     profile = detect_pdf_profile(file_path)
     total_pages = profile["page_count"]
 
-    # Determine effective OCR mode
-    if enable_ocr is None:
-        # Auto-detect: if document has native text, disable OCR for 10x speedup
-        effective_ocr = not profile["is_digital_native"]
-        detection_reason = "auto_detected"
-    else:
-        effective_ocr = bool(enable_ocr)
-        detection_reason = "user_override"
-
     # Validate and normalize page_range
     effective_page_range: Optional[Tuple[int, int]] = None
     if page_range:
         p_start = max(1, min(page_range[0], total_pages))
         p_end = max(p_start, min(page_range[1], total_pages))
         effective_page_range = (p_start, p_end)
+
+    # Determine effective OCR mode
+    if enable_ocr is None:
+        # Inspect pages within effective_page_range (or all pages if no range is specified):
+        # if any page has fewer characters than the threshold (60.0), activate OCR
+        pages_to_check = (
+            profile["char_counts"][effective_page_range[0]-1 : effective_page_range[1]]
+            if effective_page_range
+            else profile["char_counts"]
+        )
+        effective_ocr = any(c < 60.0 for c in pages_to_check)
+        detection_reason = "auto_detected"
+    else:
+        effective_ocr = bool(enable_ocr)
+        detection_reason = "user_override"
+
 
     converter = get_cached_converter(
         enable_ocr=effective_ocr,
@@ -294,9 +305,10 @@ def parse_xml(file_path: str, user_rfc: Optional[str] = None) -> Tuple[Optional[
     if not os.path.exists(file_path):
         raise FileNotFoundError(f"No se encontró el archivo XML: {file_path}")
 
-    parser = etree.XMLParser(recover=True, remove_comments=True)
+    parser = etree.XMLParser(recover=True, remove_comments=True, resolve_entities=False, no_network=True)
     try:
         tree = etree.parse(file_path, parser=parser)
+
         root = tree.getroot()
     except Exception:
         # Fallback for encoding anomalies (Latin-1, UTF-16, etc.)
@@ -402,7 +414,15 @@ def _parse_single_cfdi(comp: etree._Element, user_rfc: Optional[str] = None) -> 
     serie = comp.get("Serie") or comp.get("serie") or ""
     folio_completo = f"{serie}-{folio}".strip("-") if (serie or folio) else "S/F"
 
+    moneda = (comp.get("Moneda") or comp.get("moneda") or "MXN").strip()
+    tc_raw = (comp.get("TipoCambio") or comp.get("tipoCambio") or "0").strip()
+    try:
+        tipo_cambio = float(tc_raw.replace(",", ""))
+    except ValueError:
+        tipo_cambio = 0.0
+
     # UUID from TimbreFiscalDigital
+
     uuid_elems = comp.xpath(".//*[local-name()='TimbreFiscalDigital']")
     uuid = uuid_elems[0].get("UUID") or "" if uuid_elems else ""
     if folio_completo == "S/F" and uuid:
@@ -665,27 +685,24 @@ def _parse_single_cfdi(comp: etree._Element, user_rfc: Optional[str] = None) -> 
                 extra = m_desc
             else:
                 d_upper = m_desc.upper()
-                if "MERCADOPAGO" in d_upper or "MERCADO PAGO" in d_upper:
-                    m_flow = TipoTransaccion.EGRESO
-                else:
-                    m_flow = None
-                    for kw in expense_kw:
-                        if kw in d_upper:
-                            m_flow = TipoTransaccion.EGRESO
+                m_flow = None
+                for kw in expense_kw:
+                    if re.search(rf"\b{re.escape(kw)}\b", d_upper):
+                        m_flow = TipoTransaccion.EGRESO
+                        break
+                if not m_flow:
+                    for kw in income_kw:
+                        if re.search(rf"\b{re.escape(kw)}\b", d_upper):
+                            m_flow = TipoTransaccion.INGRESO
                             break
-                    if not m_flow:
-                        for kw in income_kw:
-                            if kw in d_upper:
-                                m_flow = TipoTransaccion.INGRESO
-                                break
-                    if not m_flow:
-                        if is_credit_card:
-                            if re.search(r"\bPAGO[S]?\b", d_upper):
-                                m_flow = TipoTransaccion.INGRESO
-                            else:
-                                m_flow = TipoTransaccion.EGRESO
+                if not m_flow:
+                    if is_credit_card:
+                        if re.search(r"\bPAGO[S]?\b", d_upper):
+                            m_flow = TipoTransaccion.INGRESO
                         else:
-                            m_flow = default_tipo
+                            m_flow = TipoTransaccion.EGRESO
+                    else:
+                        m_flow = default_tipo
                 extra = m_desc
 
             if cuenta:
@@ -728,8 +745,7 @@ def _parse_single_cfdi(comp: etree._Element, user_rfc: Optional[str] = None) -> 
             if traslados > 0 or retenciones > 0:
                 imp_final = round(imp_sub + traslados - retenciones - descuento, 2)
             elif len(conceptos) == 1 and total > 0:
-                has_global_taxes = bool(comp.xpath(".//*[local-name()='Impuestos']"))
-                imp_final = total if has_global_taxes else imp_sub
+                imp_final = total
             elif subtotal > 0 and total > 0 and abs(total - subtotal) > 0.01:
                 imp_final = round(imp_sub * tax_ratio, 2)
             else:
@@ -741,6 +757,8 @@ def _parse_single_cfdi(comp: etree._Element, user_rfc: Optional[str] = None) -> 
                 extra += f" | UUID: {uuid}"
             if clave:
                 extra += f" | Clave: {clave}"
+            if moneda.upper() not in ("MXN", "XXX") and tipo_cambio > 0:
+                extra += f" | Moneda: {moneda} (TC: {tipo_cambio})"
 
             txs.append(
                 Transaccion(
@@ -755,6 +773,8 @@ def _parse_single_cfdi(comp: etree._Element, user_rfc: Optional[str] = None) -> 
         extra = f"CFDI {tipo_comprobante} Folio: {folio_completo} | Emisor: {emisor_nombre} ({emisor_rfc})"
         if uuid:
             extra += f" | UUID: {uuid}"
+        if moneda.upper() not in ("MXN", "XXX") and tipo_cambio > 0:
+            extra += f" | Moneda: {moneda} (TC: {tipo_cambio})"
         txs.append(
             Transaccion(
                 fecha=fecha,
@@ -769,6 +789,7 @@ def _parse_single_cfdi(comp: etree._Element, user_rfc: Optional[str] = None) -> 
 
 
 def _parse_ofx_xml(root: etree._Element) -> List[Transaccion]:
+
     """
     Parses Open Financial Exchange (OFX) XML banking statement files deterministically.
     """
@@ -1161,4 +1182,73 @@ def resolve_xml_strategy(
             "strategy_label": "🤖 Forzar Ollama LLM",
             "xml_mode": "llm"
         }
+
+
+def extract_statement_balances(text: str) -> Dict[str, Optional[float]]:
+    """
+    Deterministically extracts opening (saldo_inicial) and closing (saldo_final)
+    balances from document text, markdown tables, or XML representations.
+
+    Args:
+        text: Raw document text, markdown content, or XML string.
+
+    Returns:
+        Dict[str, Optional[float]]: Dictionary containing 'saldo_inicial' and 'saldo_final'.
+    """
+    balances: Dict[str, Optional[float]] = {
+        "saldo_inicial": None,
+        "saldo_final": None
+    }
+    if not text or not isinstance(text, str):
+        return balances
+
+    # 1. XML attribute checks (e.g. ecb:EstadoDeCuentaBancario or OFX LEDGERBAL)
+    ecb_ini = re.search(r"""(?:saldoInicial|saldoAnterior)\s*=\s*["']\s*([-\d,]+\.\d{2})["']""", text, re.I)
+    if ecb_ini:
+        try:
+            balances["saldo_inicial"] = float(ecb_ini.group(1).replace(",", ""))
+        except ValueError:
+            pass
+
+    ecb_fin = re.search(r"""(?:saldoFinal|saldoAlCorte)\s*=\s*["']\s*([-\d,]+\.\d{2})["']""", text, re.I)
+    if ecb_fin:
+        try:
+            balances["saldo_final"] = float(ecb_fin.group(1).replace(",", ""))
+        except ValueError:
+            pass
+
+    ofx_bal = re.search(r"""<LEDGERBAL>[\s\S]*?<BALAMT>\s*([-\d,]+\.\d{2})""", text, re.I)
+    if ofx_bal and balances["saldo_final"] is None:
+        try:
+            balances["saldo_final"] = float(ofx_bal.group(1).replace(",", ""))
+        except ValueError:
+            pass
+
+    # 2. Text / Markdown patterns for Spanish bank statements
+    if balances["saldo_inicial"] is None:
+        ini_m = re.search(
+            r"(?:saldo\s+anterior|saldo\s+inicial|saldo\s+al\s+inicio)[^\d\n\$]{0,40}\$?\s*([\d,]+\.\d{2})",
+            text,
+            re.I
+        )
+        if ini_m:
+            try:
+                balances["saldo_inicial"] = float(ini_m.group(1).replace(",", ""))
+            except ValueError:
+                pass
+
+    if balances["saldo_final"] is None:
+        fin_m = re.search(
+            r"(?:saldo\s+actual|saldo\s+final|nuevo\s+saldo|saldo\s+al\s+corte)[^\d\n\$]{0,40}\$?\s*([\d,]+\.\d{2})",
+            text,
+            re.I
+        )
+        if fin_m:
+            try:
+                balances["saldo_final"] = float(fin_m.group(1).replace(",", ""))
+            except ValueError:
+                pass
+
+    return balances
+
 

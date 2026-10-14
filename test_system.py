@@ -15,10 +15,16 @@ import unittest
 import pandas as pd
 from lxml import etree
 
-from models import Transaccion, TipoTransaccion, TransaccionesResponse
+from models import Transaccion, TipoTransaccion, TransaccionesResponse, ReconciliacionResultado
 from date_utils import normalize_spanish_date
-from parsers import parse_xml
-from utils import create_standard_dataframe, df_to_excel_bytes, df_to_tsv, df_to_csv_bytes
+from parsers import parse_xml, extract_statement_balances
+from utils import (
+    create_standard_dataframe,
+    df_to_excel_bytes,
+    df_to_tsv,
+    df_to_csv_bytes,
+    reconcile_transactions,
+)
 
 
 class TestFinancialExtractor(unittest.TestCase):
@@ -93,7 +99,7 @@ class TestFinancialExtractor(unittest.TestCase):
             tx = txs[0]
             self.assertEqual(tx.fecha, "2024-05-20")
             self.assertEqual(tx.concepto, "COMISION FEDERAL DE ELECTRICIDAD")
-            self.assertEqual(tx.importe, 2500.00)
+            self.assertEqual(tx.importe, 2900.00)
             self.assertEqual(tx.tipo, TipoTransaccion.EGRESO)
             self.assertIn("Folio: 9876", tx.descripcion)
         finally:
@@ -626,6 +632,65 @@ class TestFinancialExtractor(unittest.TestCase):
         override_xml = resolve_xml_strategy("🤖 Forzar Ollama LLM", general_strategy=gen_xml_det)
         self.assertEqual(override_xml["strategy_label"], "🤖 Forzar Ollama LLM")
         self.assertEqual(override_xml["xml_mode"], "llm")
+
+    def test_arithmetic_reconciliation_debit_and_credit(self):
+        """Verifies reconcile_transactions accurately reconciles both debit and credit card statements and flags discrepancies."""
+        # 1. Debit account: Saldo Inicial 1000 + Ingreso 2500 - Egreso 500 = Saldo Final 3000
+        tx_ingreso = Transaccion(fecha="2024-01-10", concepto="Abono Nómina", importe=2500.0, descripcion="Transferencia nómina", tipo=TipoTransaccion.INGRESO)
+        tx_egreso = Transaccion(fecha="2024-01-12", concepto="Retiro Cajero", importe=500.0, descripcion="Retiro efectivo", tipo=TipoTransaccion.EGRESO)
+
+        res_debito = reconcile_transactions([tx_ingreso, tx_egreso], saldo_inicial=1000.0, saldo_final=3000.0)
+        self.assertTrue(res_debito.conciliado)
+        self.assertEqual(res_debito.modo_calculo, "debito")
+        self.assertEqual(res_debito.total_ingresos, 2500.0)
+        self.assertEqual(res_debito.total_egresos, 500.0)
+        self.assertEqual(res_debito.saldo_final_calculado, 3000.0)
+        self.assertEqual(res_debito.diferencia, 0.0)
+
+        # 2. Credit card debt account: Saldo Inicial 5000 - Pago/Ingreso 2000 + Compras/Egreso 800 = Saldo Final 3800
+        tx_pago = Transaccion(fecha="2024-01-05", concepto="Pago Tarjeta", importe=2000.0, descripcion="Pago en ventanilla", tipo=TipoTransaccion.INGRESO)
+        tx_compra = Transaccion(fecha="2024-01-15", concepto="Compra Tienda", importe=800.0, descripcion="Supermercado", tipo=TipoTransaccion.EGRESO)
+
+        res_credito = reconcile_transactions([tx_pago, tx_compra], saldo_inicial=5000.0, saldo_final=3800.0)
+        self.assertTrue(res_credito.conciliado)
+        self.assertEqual(res_credito.modo_calculo, "credito")
+        self.assertEqual(res_credito.total_ingresos, 2000.0)
+        self.assertEqual(res_credito.total_egresos, 800.0)
+        self.assertEqual(res_credito.saldo_final_calculado, 3800.0)
+        self.assertEqual(res_credito.diferencia, 0.0)
+
+        # 3. Discrepancy detection: Missing a transaction
+        res_discrepancia = reconcile_transactions([tx_ingreso], saldo_inicial=1000.0, saldo_final=3000.0)
+        self.assertFalse(res_discrepancia.conciliado)
+        self.assertGreater(res_discrepancia.diferencia, 0.05)
+
+        # 4. Incomplete statement balances
+        res_nd = reconcile_transactions([tx_ingreso], saldo_inicial=None, saldo_final=3000.0)
+        self.assertIsNone(res_nd.conciliado)
+        self.assertEqual(res_nd.modo_calculo, "no_disponible")
+
+    def test_extract_statement_balances_regex(self):
+        """Verifies extract_statement_balances extracts saldo_inicial and saldo_final from text/markdown blocks."""
+        sample_markdown = """
+        # ESTADO DE CUENTA BANCARIO - BANCO NACIONAL
+        Periodo: Del 01/01/2024 al 31/01/2024
+        
+        | Concepto Resumen | Monto |
+        |---|---|
+        | Saldo Anterior | $ 12,450.50 |
+        | Total de Depósitos / Abonos | $ 5,000.00 |
+        | Total de Retiros / Cargos | $ 3,200.00 |
+        | Saldo Actual al Corte | $ 14,250.50 |
+        """
+        balances = extract_statement_balances(sample_markdown)
+        self.assertEqual(balances.get("saldo_inicial"), 12450.50)
+        self.assertEqual(balances.get("saldo_final"), 14250.50)
+
+        # Alternate phrasing in text
+        text_phrasing = "Resumen del periodo: Saldo inicial: $1,500.00. Nuevo saldo al corte: $2,800.75"
+        balances_alt = extract_statement_balances(text_phrasing)
+        self.assertEqual(balances_alt.get("saldo_inicial"), 1500.00)
+        self.assertEqual(balances_alt.get("saldo_final"), 2800.75)
 
 
 if __name__ == "__main__":

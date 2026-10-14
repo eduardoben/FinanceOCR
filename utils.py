@@ -10,8 +10,12 @@ Provides fast conversions to:
 
 import io
 import json
+from typing import List, Optional
 import pandas as pd
 import streamlit as st
+
+from models import Transaccion, TipoTransaccion, ReconciliacionResultado
+
 
 
 def create_standard_dataframe(transactions: list) -> pd.DataFrame:
@@ -135,3 +139,76 @@ def render_clipboard_button(tsv_data: str, label: str = "Copiar a Portapapeles (
     </div>
     """
     st.components.v1.html(html_code, height=50)
+
+
+def reconcile_transactions(
+    transactions: List[Transaccion],
+    saldo_inicial: Optional[float],
+    saldo_final: Optional[float]
+) -> ReconciliacionResultado:
+    """
+    Performs arithmetic balance reconciliation to verify 100% extraction certainty.
+    Supports both standard debit accounts and credit card statements.
+
+    Args:
+        transactions: List of extracted Transaccion items.
+        saldo_inicial: Stated opening balance from document or None.
+        saldo_final: Stated closing balance from document or None.
+
+    Returns:
+        ReconciliacionResultado with calculations, difference, and certainty status.
+    """
+    total_ingresos = round(
+        sum(float(tx.importe) for tx in transactions if tx.tipo == TipoTransaccion.INGRESO or tx.tipo == "ingreso"),
+        2
+    )
+    total_egresos = round(
+        sum(float(tx.importe) for tx in transactions if tx.tipo == TipoTransaccion.EGRESO or tx.tipo == "egreso"),
+        2
+    )
+
+    if saldo_inicial is None or saldo_final is None:
+        return ReconciliacionResultado(
+            saldo_inicial=saldo_inicial,
+            saldo_final_declarado=saldo_final,
+            saldo_final_calculado=None,
+            total_ingresos=total_ingresos,
+            total_egresos=total_egresos,
+            diferencia=None,
+            conciliado=None,
+            modo_calculo="no_disponible"
+        )
+
+    s_ini = round(float(saldo_inicial), 2)
+    s_fin = round(float(saldo_final), 2)
+
+    # 1. Debit / Checking equation: Saldo Inicial + Ingresos - Egresos
+    calc_debito = round(s_ini + total_ingresos - total_egresos, 2)
+    diff_debito = round(abs(calc_debito - s_fin), 2)
+
+    # 2. Credit Card equation: Saldo Inicial - Ingresos (pagos) + Egresos (compras)
+    calc_credito = round(s_ini - total_ingresos + total_egresos, 2)
+    diff_credito = round(abs(calc_credito - s_fin), 2)
+
+    if diff_debito <= diff_credito:
+        modo = "debito"
+        calc_final = calc_debito
+        diff = diff_debito
+    else:
+        modo = "credito"
+        calc_final = calc_credito
+        diff = diff_credito
+
+    conciliado = diff <= 0.05
+
+    return ReconciliacionResultado(
+        saldo_inicial=s_ini,
+        saldo_final_declarado=s_fin,
+        saldo_final_calculado=calc_final,
+        total_ingresos=total_ingresos,
+        total_egresos=total_egresos,
+        diferencia=diff,
+        conciliado=conciliado,
+        modo_calculo=modo
+    )
+

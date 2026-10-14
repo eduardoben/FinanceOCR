@@ -13,7 +13,7 @@ import httpx
 from pydantic import ValidationError
 
 from models import Transaccion, TransaccionesResponse
-from date_utils import normalize_spanish_date
+from date_utils import normalize_spanish_date, extract_statement_year
 
 import re
 
@@ -299,12 +299,13 @@ def extract_transactions_with_ollama(
     clean_url = base_url.rstrip("/")
     compacted_text = compact_markdown_tables(text_content)
     all_chunks = chunk_text(compacted_text, max_chunk_chars=1800, max_table_rows=6)
-    
+
     # Filter candidate chunks containing financial transactions
     candidate_chunks = [c for c in all_chunks if chunk_has_transaction_rows(c)]
     if not candidate_chunks:
-        # Fallback to non-empty chunks if document lacks standard table pipes
-        candidate_chunks = [c for c in all_chunks if c.strip()]
+        return []
+
+    statement_year = extract_statement_year(text_content)
 
     print(
         f"[Ollama] Analizando {len(candidate_chunks)} fragmento(s) financiero(s) "
@@ -312,11 +313,20 @@ def extract_transactions_with_ollama(
     )
 
     all_transactions: List[Transaccion] = []
+    prev_chunk_keys = set()
 
     with httpx.Client(timeout=timeout_seconds) as client:
         for chunk_idx, chunk in enumerate(candidate_chunks):
             if not chunk.strip():
                 continue
+
+            user_prompt = ""
+            if statement_year:
+                user_prompt += f"Contexto del documento: Año del estado de cuenta = {statement_year}.\n\n"
+            user_prompt += (
+                f"Analiza la siguiente tabla o fragmento del estado de cuenta y extrae las transacciones financieras individuales:\n\n"
+                f"```text\n{chunk}\n```"
+            )
 
             payload = {
                 "model": model,
@@ -324,10 +334,7 @@ def extract_transactions_with_ollama(
                     {"role": "system", "content": SYSTEM_PROMPT},
                     {
                         "role": "user",
-                        "content": (
-                            f"Analiza la siguiente tabla o fragmento del estado de cuenta y extrae las transacciones financieras individuales:\n\n"
-                            f"```text\n{chunk}\n```"
-                        )
+                        "content": user_prompt
                     }
                 ],
                 "stream": False,
@@ -357,11 +364,23 @@ def extract_transactions_with_ollama(
                     chunk_txs = clean_and_parse_llm_json(raw_message_content, thinking_content)
                     print(f"[Ollama] Fragmento {chunk_idx + 1}/{len(candidate_chunks)}: {len(chunk_txs)} transacciones extraídas.")
 
-                    # Post-process transactions to ensure dates are strictly YYYY-MM-DD
+                    current_chunk_keys = set()
                     for tx in chunk_txs:
-                        tx.fecha = normalize_spanish_date(tx.fecha)
+                        # Normalize date with statement year fallback
+                        tx.fecha = normalize_spanish_date(tx.fecha, default_year=statement_year)
+                        if tx.importe <= 0.001:
+                            continue
+                        desc_clean = tx.descripcion.strip().lower() if tx.descripcion else ""
+                        key = (tx.fecha, tx.concepto.strip().lower(), round(tx.importe, 2), tx.tipo, desc_clean)
+
+                        # Adjacent chunk deduplication: filters out rows split/repeated across chunk boundaries,
+                        # while preserving legitimate same-day twin transactions within the current chunk
+                        if key in prev_chunk_keys:
+                            continue
+                        current_chunk_keys.add(key)
                         all_transactions.append(tx)
 
+                    prev_chunk_keys = current_chunk_keys
                     success = True
 
                 except (httpx.ConnectError, httpx.TimeoutException) as conn_err:
@@ -386,26 +405,17 @@ def extract_transactions_with_ollama(
                 except Exception as e:
                     last_err = e
                     print(f"[Advertencia] Fragmento {chunk_idx + 1}/{len(candidate_chunks)} error de análisis: {str(e)}")
-                    break
+                    if attempt < max_retries:
+                        backoff = 1.5 * attempt
+                        time.sleep(backoff)
+                    else:
+                        raise RuntimeError(f"Error en fragmento {chunk_idx + 1} de {len(candidate_chunks)}: {str(e)}") from e
 
-            if not success and isinstance(last_err, (httpx.ConnectError, httpx.TimeoutException)):
+            if not success:
                 raise RuntimeError(
-                    f"Error de conexión a Ollama tras {max_retries} intentos: {str(last_err)}"
+                    f"Error de extracción en Ollama en fragmento {chunk_idx + 1} tras {max_retries} intentos: {str(last_err)}"
                 ) from last_err
 
-    # Deduplicate transactions while preserving legitimate twin transactions:
-    # Includes description to ensure same-day same-merchant transactions with distinct details are retained.
-    seen = set()
-    unique_transactions: List[Transaccion] = []
-    for tx in all_transactions:
-        # Ignore zero-amount anomalies
-        if tx.importe <= 0.001:
-            continue
-        desc_clean = tx.descripcion.strip().lower() if tx.descripcion else ""
-        key = (tx.fecha, tx.concepto.strip().lower(), round(tx.importe, 2), tx.tipo, desc_clean)
-        if key not in seen:
-            seen.add(key)
-            unique_transactions.append(tx)
+    print(f"[Ollama] Extracción finalizada: {len(all_transactions)} transacciones identificadas.")
+    return all_transactions
 
-    print(f"[Ollama] Extracción finalizada: {len(unique_transactions)} transacciones únicas identificadas.")
-    return unique_transactions

@@ -5,8 +5,9 @@ Standardizes the extracted transaction schema across all parsers, LLM pipelines,
 and export modules.
 """
 
+import re
 from enum import Enum
-from typing import List
+from typing import List, Optional
 from pydantic import BaseModel, Field, field_validator
 
 
@@ -50,18 +51,22 @@ class Transaccion(BaseModel):
     @field_validator("importe", mode="before")
     @classmethod
     def sanitize_importe(cls, v: any) -> float:
-        """Ensure importe is strictly an absolute float value."""
+        """Ensure importe is strictly an absolute float value, handling accounting formats."""
         if isinstance(v, (int, float)):
             return abs(float(v))
         if isinstance(v, str):
-            # Remove currency symbols, commas, spaces, negative signs
-            cleaned = v.replace("$", "").replace("MXN", "").replace("USD", "").replace(",", "").strip()
-            if cleaned.startswith("-") or cleaned.startswith("+"):
-                cleaned = cleaned[1:].strip()
-            try:
-                return abs(float(cleaned))
-            except ValueError:
-                return 0.0
+            # Remove currency symbols, commas, spaces, parentheses, negative signs, and accounting suffixes
+            # Handles accounting formats: (1,250.50), 1,250.50-, 1,250.50 CR/DR/CARGO/ABONO
+            cleaned = re.sub(r"(?i)\b(MXN|USD|CR|DR|CARGO|ABONO)\b", "", v)
+            cleaned = cleaned.replace("$", "").replace(",", "").replace("(", "").replace(")", "").strip()
+            # Extract first valid decimal numeric pattern
+            match = re.search(r"\d+(?:\.\d+)?", cleaned)
+            if match:
+                try:
+                    return abs(float(match.group(0)))
+                except ValueError:
+                    return 0.0
+            return 0.0
         return 0.0
 
 
@@ -71,3 +76,15 @@ class TransaccionesResponse(BaseModel):
         default_factory=list,
         description="Lista de transacciones financieras individuales extraídas"
     )
+
+
+class ReconciliacionResultado(BaseModel):
+    """Container for arithmetic balance reconciliation metrics."""
+    saldo_inicial: Optional[float] = None
+    saldo_final_declarado: Optional[float] = None
+    saldo_final_calculado: Optional[float] = None
+    total_ingresos: float = 0.0
+    total_egresos: float = 0.0
+    diferencia: Optional[float] = None
+    conciliado: Optional[bool] = None
+    modo_calculo: str = "no_disponible"  # "debito", "credito", or "no_disponible"

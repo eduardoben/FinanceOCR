@@ -45,3 +45,5 @@ tmp/
 *~
 .DS_Store
 Thumbs.db
+# Ignore all files in the 'documentos' folder (e.g., 'data/documentos/')
+data/documentos/

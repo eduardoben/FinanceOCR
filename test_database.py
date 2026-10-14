@@ -187,6 +187,48 @@ class TestDatabaseLayer(unittest.TestCase):
         self.assertEqual(stats_after["total_archivos"], 1)
         self.assertEqual(stats_after["total_transacciones"], 2)
 
+    def test_generic_filename_collision_no_data_loss(self):
+        """Verifies that two bank statements with identical filenames but different hashes coexist safely."""
+        fname = "EstadoDeCuenta.pdf"
+        hash_jan = compute_file_hash(b"January Statement Bytes")
+        hash_feb = compute_file_hash(b"February Statement Bytes")
+
+        txs_jan = [
+            Transaccion(
+                fecha="2024-01-15",
+                concepto="Nomina Enero",
+                importe=15000.0,
+                descripcion="Pago quincenal",
+                tipo=TipoTransaccion.INGRESO
+            )
+        ]
+        txs_feb = [
+            Transaccion(
+                fecha="2024-02-15",
+                concepto="Nomina Febrero",
+                importe=15000.0,
+                descripcion="Pago quincenal",
+                tipo=TipoTransaccion.INGRESO
+            )
+        ]
+
+        save_processed_transactions(fname, hash_jan, "pdf", txs_jan, overwrite=False, db_path=self.db_path)
+        # Upload February with the exact same generic filename and overwrite=True
+        save_processed_transactions(fname, hash_feb, "pdf", txs_feb, overwrite=True, db_path=self.db_path)
+
+        # Both records must be preserved
+        stats = get_database_stats(self.db_path)
+        self.assertEqual(stats["total_archivos"], 2)
+        self.assertEqual(stats["total_transacciones"], 2)
+
+        # Query each by hash exclusively
+        check_jan = check_file_processed(fname, hash_jan, db_path=self.db_path)
+        check_feb = check_file_processed(fname, hash_feb, db_path=self.db_path)
+        self.assertIsNotNone(check_jan)
+        self.assertIsNotNone(check_feb)
+        self.assertNotEqual(check_jan["id"], check_feb["id"])
+
+
     def test_cascade_deletion(self):
         """Verifies that deleting an archivos_procesados record automatically deletes its transacciones."""
         fname = "bbva_feb.pdf"
@@ -412,10 +454,10 @@ class TestDatabaseLayer(unittest.TestCase):
         path_v1 = get_document_file_path(id_1, db_path=self.db_path)
         self.assertTrue(os.path.exists(path_v1))
 
-        # Overwrite with V2
+        # Overwrite with V2 (updated statement file with renamed target)
         id_2 = save_processed_transactions(
-            filename=fname,
-            file_hash=h2,
+            filename="reemplazo_renombrado.pdf",
+            file_hash=h1,
             file_type="pdf",
             transactions=txs,
             file_bytes=v2_bytes,
@@ -425,6 +467,7 @@ class TestDatabaseLayer(unittest.TestCase):
         path_v2 = get_document_file_path(id_2, db_path=self.db_path)
         self.assertTrue(os.path.exists(path_v2))
         self.assertFalse(os.path.exists(path_v1))
+
 
     def test_batch_checkpoint_lifecycle(self):
         """Verifies checkpoint creation, file completion updates, and successful clearing."""

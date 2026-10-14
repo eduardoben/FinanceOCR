@@ -84,14 +84,22 @@ def db_session(db_path: str = DEFAULT_DB_PATH) -> Generator[sqlite3.Connection, 
         conn.close()
 
 
+# In-memory registry to eliminate redundant DDL execution on warm databases
+_INITIALIZED_DBS: set[str] = set()
+
+
 def init_db(db_path: str = DEFAULT_DB_PATH) -> None:
     """
     Initializes database schema and B-Tree indexes if they do not already exist.
-    Also executes safe migrations for new columns (ruta_archivo, tamano_bytes).
+    Also executes safe migrations for new columns (ruta_archivo, tamano_bytes, reconciliation fields).
 
     Args:
         db_path: Target database file path.
     """
+    abs_p = os.path.abspath(db_path)
+    if abs_p in _INITIALIZED_DBS and os.path.exists(abs_p):
+        return
+
     ddl_script = """
     PRAGMA foreign_keys = ON;
 
@@ -105,7 +113,11 @@ def init_db(db_path: str = DEFAULT_DB_PATH) -> None:
         rango_fecha_inicio TEXT,
         rango_fecha_fin TEXT,
         ruta_archivo TEXT,
-        tamano_bytes INTEGER
+        tamano_bytes INTEGER,
+        saldo_inicial REAL,
+        saldo_final REAL,
+        diferencia_conciliacion REAL,
+        conciliado INTEGER
     );
 
     CREATE TABLE IF NOT EXISTS transacciones (
@@ -141,7 +153,14 @@ def init_db(db_path: str = DEFAULT_DB_PATH) -> None:
     with db_session(db_path) as conn:
         conn.executescript(ddl_script)
         # Automatic non-destructive schema migrations for existing databases
-        for col, col_type in [("ruta_archivo", "TEXT"), ("tamano_bytes", "INTEGER")]:
+        for col, col_type in [
+            ("ruta_archivo", "TEXT"),
+            ("tamano_bytes", "INTEGER"),
+            ("saldo_inicial", "REAL"),
+            ("saldo_final", "REAL"),
+            ("diferencia_conciliacion", "REAL"),
+            ("conciliado", "INTEGER"),
+        ]:
             try:
                 conn.execute(f"ALTER TABLE archivos_procesados ADD COLUMN {col} {col_type};")
             except sqlite3.OperationalError:
@@ -152,6 +171,9 @@ def init_db(db_path: str = DEFAULT_DB_PATH) -> None:
         sync_legacy_stored_files(db_path)
     except Exception:
         pass
+
+    _INITIALIZED_DBS.add(abs_p)
+
 
 
 def sync_legacy_stored_files(db_path: str = DEFAULT_DB_PATH) -> int:
@@ -286,10 +308,10 @@ def check_file_processed(
     db_path: str = DEFAULT_DB_PATH
 ) -> Optional[Dict[str, Any]]:
     """
-    Checks if a bank statement was previously processed by hash or filename.
+    Checks if a bank statement was previously processed by cryptographic hash.
 
     Args:
-        filename: Name of the uploaded file.
+        filename: Name of the uploaded file (retained for signature compatibility).
         file_hash: SHA-256 hex digest of the file bytes.
         db_path: Target database path.
 
@@ -300,14 +322,14 @@ def check_file_processed(
     query = """
     SELECT id, nombre_archivo, hash_sha256, tipo_archivo, fecha_procesamiento,
            total_transacciones, rango_fecha_inicio, rango_fecha_fin,
-           ruta_archivo, tamano_bytes
+           ruta_archivo, tamano_bytes,
+           saldo_inicial, saldo_final, diferencia_conciliacion, conciliado
     FROM archivos_procesados
-    WHERE hash_sha256 = ? OR nombre_archivo = ?
-    ORDER BY (hash_sha256 = ?) DESC
+    WHERE hash_sha256 = ?
     LIMIT 1;
     """
     with db_session(db_path) as conn:
-        cursor = conn.execute(query, (file_hash, filename, file_hash))
+        cursor = conn.execute(query, (file_hash,))
         row = cursor.fetchone()
         if row:
             return dict(row)
@@ -322,13 +344,17 @@ def save_processed_transactions(
     file_bytes: Optional[bytes] = None,
     stored_path: Optional[str] = None,
     overwrite: bool = False,
+    saldo_inicial: Optional[float] = None,
+    saldo_final: Optional[float] = None,
+    diferencia_conciliacion: Optional[float] = None,
+    conciliado: Optional[bool] = None,
     db_path: str = DEFAULT_DB_PATH
 ) -> int:
     """
     Persists an extracted bank statement, its transactions, and its source document atomically.
 
-    If overwrite is True, any existing record matching the hash or filename is
-    deleted beforehand along with its transactions via ON DELETE CASCADE and old stored file.
+    If overwrite is True, any existing record matching the hash is deleted beforehand
+    along with its transactions via ON DELETE CASCADE and old stored file.
 
     Args:
         filename: Name of the statement file.
@@ -338,6 +364,10 @@ def save_processed_transactions(
         file_bytes: Optional binary content of the statement to store permanently.
         stored_path: Optional existing path to the stored document.
         overwrite: When True, replaces prior occurrences of this statement.
+        saldo_inicial: Optional opening balance stated in document.
+        saldo_final: Optional closing balance stated in document.
+        diferencia_conciliacion: Optional difference from arithmetic reconciliation.
+        conciliado: Optional boolean flag indicating mathematical reconciliation.
         db_path: Database path.
 
     Returns:
@@ -364,8 +394,8 @@ def save_processed_transactions(
         if overwrite:
             # Query and delete prior physical file if it differs
             old_rows = conn.execute(
-                "SELECT ruta_archivo FROM archivos_procesados WHERE hash_sha256 = ? OR nombre_archivo = ?;",
-                (file_hash, filename)
+                "SELECT ruta_archivo FROM archivos_procesados WHERE hash_sha256 = ?;",
+                (file_hash,)
             ).fetchall()
             for r in old_rows:
                 old_p = r["ruta_archivo"]
@@ -375,21 +405,24 @@ def save_processed_transactions(
                     except Exception:
                         pass
 
-            # Delete prior record by hash or filename
+            # Delete prior record solely by hash
             conn.execute(
-                "DELETE FROM archivos_procesados WHERE hash_sha256 = ? OR nombre_archivo = ?;",
-                (file_hash, filename)
+                "DELETE FROM archivos_procesados WHERE hash_sha256 = ?;",
+                (file_hash,)
             )
 
         # Insert parent file record
+        conciliado_int = 1 if conciliado is True else (0 if conciliado is False else None)
         cursor = conn.execute(
             """
             INSERT INTO archivos_procesados (
                 nombre_archivo, hash_sha256, tipo_archivo,
                 fecha_procesamiento, total_transacciones,
                 rango_fecha_inicio, rango_fecha_fin,
-                ruta_archivo, tamano_bytes
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?);
+                ruta_archivo, tamano_bytes,
+                saldo_inicial, saldo_final,
+                diferencia_conciliacion, conciliado
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
             """,
             (
                 filename,
@@ -400,10 +433,15 @@ def save_processed_transactions(
                 rango_inicio,
                 rango_fin,
                 ruta_almacenada,
-                tamano
+                tamano,
+                saldo_inicial,
+                saldo_final,
+                diferencia_conciliacion,
+                conciliado_int
             )
         )
         archivo_id = cursor.lastrowid
+
 
         # Batch insert transactions
         tx_rows = []
@@ -520,13 +558,15 @@ def get_distinct_files(db_path: str = DEFAULT_DB_PATH) -> List[Dict[str, Any]]:
     query = """
     SELECT id, nombre_archivo, tipo_archivo, fecha_procesamiento,
            total_transacciones, rango_fecha_inicio, rango_fecha_fin,
-           hash_sha256, ruta_archivo, tamano_bytes
+           hash_sha256, ruta_archivo, tamano_bytes,
+           saldo_inicial, saldo_final, diferencia_conciliacion, conciliado
     FROM archivos_procesados
     ORDER BY id DESC;
     """
     with db_session(db_path) as conn:
         cursor = conn.execute(query)
         return [dict(row) for row in cursor.fetchall()]
+
 
 
 def delete_processed_file(archivo_id: int, db_path: str = DEFAULT_DB_PATH) -> bool:

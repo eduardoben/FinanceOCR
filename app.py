@@ -9,22 +9,13 @@ export or copy directly into Excel with standard formatting.
 
 import os
 import sys
-import importlib
 import tempfile
 import multiprocessing
 from datetime import datetime
 import pandas as pd
 import streamlit as st
 
-# Hot-reload local modules if already in sys.modules so running Streamlit servers pick up code updates immediately
-for _mod_name in ["models", "date_utils", "database", "parsers", "llm_client", "telemetry", "utils"]:
-    if _mod_name in sys.modules:
-        try:
-            importlib.reload(sys.modules[_mod_name])
-        except Exception:
-            pass
-
-from models import Transaccion, TipoTransaccion
+from models import Transaccion, TipoTransaccion, ReconciliacionResultado
 from parsers import (
     parse_pdf,
     parse_xml,
@@ -32,6 +23,7 @@ from parsers import (
     render_pdf_page_image,
     resolve_pdf_strategy,
     resolve_xml_strategy,
+    extract_statement_balances,
 )
 from llm_client import check_ollama_connection, extract_transactions_with_ollama
 from telemetry import render_telemetry_expander, StageStopwatch
@@ -41,7 +33,21 @@ from utils import (
     df_to_tsv,
     df_to_csv_bytes,
     render_clipboard_button,
+    reconcile_transactions,
 )
+
+
+@st.cache_data(show_spinner=False)
+def cached_detect_pdf_profile(file_bytes: bytes) -> dict:
+    """Cached wrapper around detect_pdf_profile for snappy UI interactions."""
+    return detect_pdf_profile(file_bytes)
+
+
+@st.cache_data(show_spinner=False)
+def cached_render_pdf_page_image(file_bytes: bytes, page_number: int, scale: float = 1.0):
+    """Cached wrapper around render_pdf_page_image for instantaneous page previewing."""
+    return render_pdf_page_image(file_bytes, page_number=page_number, scale=scale)
+
 from database import (
     compute_file_hash,
     check_file_processed,
@@ -185,7 +191,7 @@ def render_statement_inspector(file_record: dict, key_prefix: str = "insp") -> N
 
     if ftype == "pdf":
         try:
-            profile = detect_pdf_profile(file_bytes)
+            profile = cached_detect_pdf_profile(file_bytes)
             page_count = profile["page_count"]
 
             c_ctrl, c_view = st.columns([1, 2])
@@ -211,7 +217,7 @@ def render_statement_inspector(file_record: dict, key_prefix: str = "insp") -> N
                 )
 
             with c_view:
-                img = render_pdf_page_image(file_bytes, page_number=int(sel_p), scale=float(zoom))
+                img = cached_render_pdf_page_image(file_bytes, page_number=int(sel_p), scale=float(zoom))
                 st.image(img, caption=f"Página {sel_p} de {page_count} — {fname}", width="stretch")
 
             if show_thumbs:
@@ -220,13 +226,14 @@ def render_statement_inspector(file_record: dict, key_prefix: str = "insp") -> N
                 for p_i in range(1, page_count + 1):
                     target_col = t_cols[(p_i - 1) % len(t_cols)]
                     try:
-                        t_img = render_pdf_page_image(file_bytes, page_number=p_i, scale=0.35)
+                        t_img = cached_render_pdf_page_image(file_bytes, page_number=p_i, scale=0.35)
                         target_col.image(t_img, caption=f"Pág. {p_i}", width="stretch")
                     except Exception:
                         pass
 
         except Exception as pdf_err:
             st.error(f"Error al visualizar PDF: {str(pdf_err)}")
+
 
     elif ftype == "xml":
         try:
@@ -534,8 +541,9 @@ def main():
                     )
 
                     try:
-                        profile = detect_pdf_profile(pdf_bytes)
+                        profile = cached_detect_pdf_profile(pdf_bytes)
                         total_pages = profile["page_count"]
+
                         is_digital = profile["is_digital_native"]
 
                         badge_html = (
@@ -679,7 +687,7 @@ def main():
 
                             with preview_col_img:
                                 try:
-                                    page_img = render_pdf_page_image(pdf_bytes, selected_preview, scale=0.85)
+                                    page_img = cached_render_pdf_page_image(pdf_bytes, selected_preview, scale=0.85)
                                     st.image(
                                         page_img,
                                         caption=f"Página {selected_preview} de {total_pages} — {pdf_f.name}",
@@ -695,10 +703,11 @@ def main():
                                 for p_num in range(1, total_pages + 1):
                                     col_target = grid_cols[(p_num - 1) % len(grid_cols)]
                                     try:
-                                        thumb_img = render_pdf_page_image(pdf_bytes, p_num, scale=0.35)
+                                        thumb_img = cached_render_pdf_page_image(pdf_bytes, p_num, scale=0.35)
                                         col_target.image(thumb_img, caption=f"Pág. {p_num}", width="stretch")
                                     except Exception:
                                         pass
+
 
                     except Exception as ex:
                         st.error(f"Error al inspeccionar {pdf_f.name}: {str(ex)}")
@@ -814,6 +823,9 @@ def main():
                 skipped_count = 0
                 has_interrupted = False
 
+                if "reconciliation_reports" not in st.session_state:
+                    st.session_state["reconciliation_reports"] = {}
+
                 for idx, file in enumerate(uploaded_files):
                     fname = file.name
                     ext = fname.lower().split(".")[-1]
@@ -829,16 +841,29 @@ def main():
                         rec = check_file_processed(fname, f_hash)
                         if rec:
                             df_prev = query_transactions(archivo_id=rec["id"])
+                            file_prev_txs = []
                             for _, r in df_prev.iterrows():
                                 tipo_str = str(r["tipo"]).lower().strip()
                                 tipo_enum = TipoTransaccion.INGRESO if tipo_str == "ingreso" else TipoTransaccion.EGRESO
-                                all_extracted.append(Transaccion(
+                                raw_desc = r.get("descripción") if "descripción" in r else r.get("descripcion")
+                                desc_val = "" if pd.isna(raw_desc) else str(raw_desc)
+                                t_obj = Transaccion(
                                     fecha=str(r["fecha"])[:10],
                                     concepto=str(r["concepto"]),
                                     importe=float(r["importe"]),
-                                    descripcion=str(r["descripcion"] or ""),
+                                    descripcion=desc_val,
                                     tipo=tipo_enum
-                                ))
+                                )
+                                all_extracted.append(t_obj)
+                                file_prev_txs.append(t_obj)
+                            rec_conc = rec.get("conciliado")
+                            conc_bool = bool(rec_conc) if rec_conc is not None else None
+                            st.session_state["reconciliation_reports"][fname] = ReconciliacionResultado(
+                                saldo_inicial=rec.get("saldo_inicial"),
+                                saldo_final_declarado=rec.get("saldo_final"),
+                                diferencia=rec.get("diferencia_conciliacion"),
+                                conciliado=conc_bool,
+                            )
                         continue
 
                     # Duplicate check: skip if previously processed in prior batches and not overwriting
@@ -849,6 +874,14 @@ def main():
                         progress_bar.progress((idx + 1) / total_files)
                         mark_checkpoint_file_completed(batch_id, fname)
                         completed_files_set.add(fname)
+                        rec_conc = dup_record.get("conciliado")
+                        conc_bool = bool(rec_conc) if rec_conc is not None else None
+                        st.session_state["reconciliation_reports"][fname] = ReconciliacionResultado(
+                            saldo_inicial=dup_record.get("saldo_inicial"),
+                            saldo_final_declarado=dup_record.get("saldo_final"),
+                            diferencia=dup_record.get("diferencia_conciliacion"),
+                            conciliado=conc_bool,
+                        )
                         continue
 
                     tmp_path = cached_files.get(fname)
@@ -860,6 +893,7 @@ def main():
 
                     status_text.info(f"⏳ ({idx + 1}/{total_files}) Procesando archivo: **{fname}**...")
                     current_file_txs: list[Transaccion] = []
+                    doc_raw_text = ""
 
                     cfg = file_configs.get(fname, {})
 
@@ -876,6 +910,7 @@ def main():
                                 stopwatch.start_stage(f"🤖 Inferencia Ollama ({file_model})")
                                 with open(tmp_path, "r", encoding="utf-8", errors="replace") as f_x:
                                     xml_raw = f_x.read()
+                                doc_raw_text = xml_raw
                                 llm_txs = extract_transactions_with_ollama(
                                     xml_raw,
                                     base_url=ollama_url,
@@ -887,11 +922,13 @@ def main():
                                 status_text.info(f"⏳ ({idx + 1}/{total_files}) Analizando XML [{strat_lbl}]: **{fname}**...")
                                 stopwatch.start_stage("📄 Estructura XML / CFDI")
                                 xml_txs, raw_text = parse_xml(tmp_path, user_rfc=effective_rfc)
+                                with open(tmp_path, "r", encoding="utf-8", errors="replace") as f_x:
+                                    doc_raw_text = f_x.read()
 
                                 if xml_txs is not None and len(xml_txs) > 0:
                                     current_file_txs.extend(xml_txs)
                                     st.toast(f"⚡ {fname}: {len(xml_txs)} movimientos extraídos [{strat_lbl}]", icon="📑")
-                                elif raw_text and xml_mode in ("hybrid", "deterministic"):
+                                elif raw_text and xml_mode == "hybrid":
                                     status_text.info(f"⏳ ({idx + 1}/{total_files}) Clasificando nodos XML con {file_model}...")
                                     stopwatch.start_stage(f"🤖 Inferencia Ollama ({file_model})")
                                     llm_txs = extract_transactions_with_ollama(
@@ -901,6 +938,8 @@ def main():
                                         num_ctx=num_ctx
                                     )
                                     current_file_txs.extend(llm_txs)
+                                elif xml_mode == "deterministic":
+                                    st.warning(f"⚠️ El archivo XML '{fname}' no pudo ser procesado en modo determinista estricto. Se requiere modo Híbrido o LLM.")
 
                         elif ext == "pdf":
                             # PDF pipeline with individual strategy & page range
@@ -923,6 +962,7 @@ def main():
                                 num_threads=num_threads,
                                 ocr_scale=effective_scale,
                             )
+                            doc_raw_text = markdown_tables
 
                             st.toast(
                                 f"⚡ {fname} [{strat_lbl}]: {meta['mode_label']} en {meta['elapsed_seconds']}s "
@@ -939,6 +979,15 @@ def main():
                             )
                             current_file_txs.extend(pdf_txs)
 
+                        # Balance extraction and Arithmetic Reconciliation
+                        doc_balances = extract_statement_balances(doc_raw_text)
+                        recon_res = reconcile_transactions(
+                            current_file_txs,
+                            doc_balances.get("saldo_inicial"),
+                            doc_balances.get("saldo_final")
+                        )
+                        st.session_state["reconciliation_reports"][fname] = recon_res
+
                         # Auto-save immediately to SQLite with persistent document retention
                         if current_file_txs:
                             save_processed_transactions(
@@ -947,7 +996,11 @@ def main():
                                 file_type=ext,
                                 transactions=current_file_txs,
                                 file_bytes=file.getvalue(),
-                                overwrite=overwrite_duplicates
+                                overwrite=overwrite_duplicates,
+                                saldo_inicial=recon_res.saldo_inicial,
+                                saldo_final=recon_res.saldo_final_declarado,
+                                diferencia_conciliacion=recon_res.diferencia,
+                                conciliado=recon_res.conciliado,
                             )
                             mark_checkpoint_file_completed(batch_id, fname)
                             completed_files_set.add(fname)
@@ -1035,6 +1088,86 @@ def main():
                 )
 
             st.write("")
+
+            # -----------------------------------------------------
+            # VERIFICACION DE CERTEZA CONTABLE (CONCILIACION DE SALDOS)
+            # -----------------------------------------------------
+            reconciliation_reports = st.session_state.get("reconciliation_reports", {})
+            if not reconciliation_reports and uploaded_files:
+                db_files = {f["nombre_archivo"]: f for f in get_distinct_files()}
+                for up_f in uploaded_files:
+                    rec_f = db_files.get(up_f.name)
+                    if rec_f and (rec_f.get("saldo_inicial") is not None or rec_f.get("saldo_final") is not None or rec_f.get("conciliado") is not None):
+                        c_val = bool(rec_f.get("conciliado")) if rec_f.get("conciliado") is not None else None
+                        reconciliation_reports[up_f.name] = ReconciliacionResultado(
+                            saldo_inicial=rec_f.get("saldo_inicial"),
+                            saldo_final_declarado=rec_f.get("saldo_final"),
+                            diferencia=rec_f.get("diferencia_conciliacion"),
+                            conciliado=c_val
+                        )
+                st.session_state["reconciliation_reports"] = reconciliation_reports
+
+            if reconciliation_reports:
+                st.markdown("#### ⚖️ Verificación de Certeza Contable (Conciliación de Saldos)")
+                st.caption(
+                    "Conciliación aritmética automática: comprueba si el Saldo Inicial + Ingresos - Egresos "
+                    "cuadra con el Saldo Final declarado en el estado de cuenta bancario."
+                )
+
+                for r_fname, r_data in reconciliation_reports.items():
+                    r_res = r_data.get("resultado") if isinstance(r_data, dict) and "resultado" in r_data else r_data
+                    if not isinstance(r_res, ReconciliacionResultado):
+                        continue
+
+                    if r_res.conciliado is True:
+                        badge_color = "#2e7d32"
+                        badge_bg = "#e8f5e9"
+                        border_color = "#a5d6a7"
+                        status_label = "Conciliado Exacto"
+                        status_badge = f"<span style='background-color:#2e7d32; color:white; padding:4px 10px; border-radius:12px; font-weight:700; font-size:12px;'>✅ {status_label}</span>"
+                        note = "Los movimientos extraídos cuadran con total precisión aritmética respecto a los saldos del documento."
+                    elif r_res.conciliado is False:
+                        badge_color = "#c62828"
+                        badge_bg = "#ffebee"
+                        border_color = "#ef9a9a"
+                        status_label = "Discrepancia Detectada"
+                        status_badge = f"<span style='background-color:#c62828; color:white; padding:4px 10px; border-radius:12px; font-weight:700; font-size:12px;'>⚠️ {status_label}</span>"
+                        diff_val = r_res.diferencia if r_res.diferencia is not None else 0.0
+                        note = f"Diferencia detectada de ${diff_val:,.2f} entre el saldo final calculado y el declarado. Verifique posibles movimientos omitidos o comisiones."
+                    else:
+                        badge_color = "#616161"
+                        badge_bg = "#f5f5f5"
+                        border_color = "#e0e0e0"
+                        status_label = "Sin Saldos Declarados en Documento"
+                        status_badge = f"<span style='background-color:#9e9e9e; color:white; padding:4px 10px; border-radius:12px; font-weight:700; font-size:12px;'>⚪ {status_label}</span>"
+                        note = "El documento no cuenta con saldos de apertura y cierre explícitos en su texto o estructura XML para validar matemáticamente."
+
+                    s_ini_str = f"${r_res.saldo_inicial:,.2f}" if r_res.saldo_inicial is not None else "N/D"
+                    s_fin_calc_str = f"${r_res.saldo_final_calculado:,.2f}" if r_res.saldo_final_calculado is not None else "N/D"
+                    s_fin_dec_str = f"${r_res.saldo_final_declarado:,.2f}" if r_res.saldo_final_declarado is not None else "N/D"
+                    diff_str = f"${r_res.diferencia:,.2f}" if r_res.diferencia is not None else "N/D"
+
+                    st.markdown(
+                        f"""
+                        <div style="background-color: {badge_bg}; border: 1px solid {border_color}; border-left: 6px solid {badge_color}; border-radius: 8px; padding: 14px 18px; margin: 12px 0;">
+                            <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px;">
+                                <div style="font-weight: 700; font-size: 15px; color: #212121;">📄 {r_fname}</div>
+                                <div>{status_badge}</div>
+                            </div>
+                            <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(130px, 1fr)); gap: 10px; font-size: 13px; color: #333; margin-bottom: 6px;">
+                                <div><small style="color: #666;">Saldo Inicial</small><br><b>{s_ini_str}</b></div>
+                                <div><small style="color: #666;">Ingresos</small><br><b style="color: #2e7d32;">${r_res.total_ingresos:,.2f}</b></div>
+                                <div><small style="color: #666;">Egresos</small><br><b style="color: #c62828;">${r_res.total_egresos:,.2f}</b></div>
+                                <div><small style="color: #666;">Saldo Final Calculado</small><br><b>{s_fin_calc_str}</b></div>
+                                <div><small style="color: #666;">Saldo Final Declarado</small><br><b>{s_fin_dec_str}</b></div>
+                                <div><small style="color: #666;">Diferencia</small><br><b style="color: {badge_color};">{diff_str}</b></div>
+                            </div>
+                            <div style="font-size: 12px; color: #616161; margin-top: 4px;"><i>{note}</i></div>
+                        </div>
+                        """,
+                        unsafe_allow_html=True
+                    )
+                st.write("")
 
             # Global Excel Download button
             excel_bytes = df_to_excel_bytes(df_ingresos, df_egresos)
