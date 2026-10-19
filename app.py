@@ -33,11 +33,18 @@ from parsers import (
     identify_low_confidence_pages,
     reextract_pages_high_res,
     reconcile_extraction_passes,
+    reextract_pages_vlm,
 )
-from llm_client import check_ollama_connection, extract_transactions_with_ollama
+from llm_client import (
+    check_ollama_connection,
+    extract_transactions_with_ollama,
+    extract_balances_vlm,
+    extract_page_transactions_vlm,
+)
 from telemetry import render_telemetry_expander, StageStopwatch
 from utils import (
     create_standard_dataframe,
+    create_audit_dataframe,
     df_to_excel_bytes,
     df_to_tsv,
     df_to_csv_bytes,
@@ -62,6 +69,7 @@ from database import (
     mark_checkpoint_file_completed,
     mark_checkpoint_interrupted,
     clear_batch_checkpoint,
+    update_transaction_review,
 )
 
 # Page configuration - Must be the very first Streamlit command
@@ -299,8 +307,8 @@ def main():
         )
         model_name = st.text_input(
             "Nombre del Modelo",
-            value="gemma4:12b",
-            help="Modelo local en Ollama optimizado para extracción estructurada (e.g., gemma4:12b, llama3.1, qwen2.5)"
+            value="qwen3-vl:4b",
+            help="Modelo multimodal local en Ollama optimizado para extracción visual y estructurada (e.g., qwen3-vl:4b, gemma4:12b, llama3.1)"
         )
 
         num_ctx = st.select_slider(
@@ -1029,6 +1037,21 @@ def main():
 
                             # Step 1: Pre-extract balances and infer mode
                             doc_balances = extract_statement_balances(doc_raw_text)
+                            if doc_balances.get("saldo_inicial") is None or doc_balances.get("saldo_final") is None:
+                                try:
+                                    p1_img = render_pdf_page_image(file.getvalue(), page_number=1, scale=2.0)
+                                    if p1_img is not None:
+                                        status_text.info(f"👁️ ({idx + 1}/{total_files}) Extrayendo saldos visualmente con {file_model}...")
+                                        vlm_bal = extract_balances_vlm(p1_img, base_url=ollama_url, model=file_model)
+                                        if vlm_bal:
+                                            for bk in ("saldo_inicial", "saldo_final", "total_cargos", "total_abonos"):
+                                                if doc_balances.get(bk) is None and vlm_bal.get(bk) is not None:
+                                                    doc_balances[bk] = vlm_bal[bk]
+                                            if vlm_bal.get("modo_sugerido") and modo_inferred == "ambiguo":
+                                                eff_mode = vlm_bal["modo_sugerido"]
+                                except Exception:
+                                    pass
+
                             modo_inferred = infer_statement_mode(doc_raw_text, doc_balances)
                             eff_mode = modo_inferred if modo_inferred != "ambiguo" else "debito"
 
@@ -1065,6 +1088,7 @@ def main():
                                             p2_txs, _, _ = parse_docling_markdown_tables(
                                                 p2_md, modo_contable=eff_mode, default_page=p_num
                                             )
+                                            cadena_ok = False
                                             if p2_txs:
                                                 p1_page_rows = [tx for tx in validated_table_txs if getattr(tx, "pagina", 1) == p_num]
                                                 rec_rows, rec_meta = reconcile_extraction_passes(
@@ -1073,6 +1097,27 @@ def main():
                                                     modo_contable=eff_mode
                                                 )
                                                 if rec_meta.get("cadena_ok"):
+                                                    cadena_ok = True
+                                                    other_rows = [tx for tx in validated_table_txs if getattr(tx, "pagina", 1) != p_num]
+                                                    validated_table_txs = other_rows + rec_rows
+
+                                            # Fallback to qwen3-vl VLM extraction if Docling ACCURATE does not square
+                                            if not cadena_ok:
+                                                status_text.info(f"👁️ ({idx + 1}/{total_files}) Verificación visual VLM pág {p_num} ({file_model}): **{fname}**...")
+                                                vlm_pages = reextract_pages_vlm(
+                                                    tmp_pdf_p,
+                                                    [p_num],
+                                                    base_url=ollama_url,
+                                                    model=file_model,
+                                                )
+                                                vlm_txs = vlm_pages.get(p_num, [])
+                                                if vlm_txs:
+                                                    p1_page_rows = [tx for tx in validated_table_txs if getattr(tx, "pagina", 1) == p_num]
+                                                    rec_rows, rec_meta = reconcile_extraction_passes(
+                                                        p1_page_rows,
+                                                        vlm_txs,
+                                                        modo_contable=eff_mode
+                                                    )
                                                     other_rows = [tx for tx in validated_table_txs if getattr(tx, "pagina", 1) != p_num]
                                                     validated_table_txs = other_rows + rec_rows
                                     finally:
@@ -1133,8 +1178,21 @@ def main():
                                 }
                                 st.toast(f"⚡ {fname}: {len(validated_table_txs)} movimientos extraídos de tablas Docling (0s LLM)", icon="📑")
 
+                            # Running balance validation across all combined transactions sorted by (pagina, fecha)
+                            if current_file_txs:
+                                current_file_txs.sort(key=lambda tx: (getattr(tx, "pagina", 1) or 1, getattr(tx, "fecha", "") or ""))
+                                current_file_txs, chain_meta = validate_running_balance_chain(
+                                    current_file_txs,
+                                    saldo_inicial=doc_balances.get("saldo_inicial"),
+                                    modo_contable=eff_mode
+                                )
+
                         # Balance extraction and Arithmetic Reconciliation
-                        doc_balances = extract_statement_balances(doc_raw_text)
+                        extra_balances = extract_statement_balances(doc_raw_text)
+                        for bk, bv in extra_balances.items():
+                            if doc_balances.get(bk) is None and bv is not None:
+                                doc_balances[bk] = bv
+
                         recon_res = reconcile_transactions(
                             current_file_txs,
                             doc_balances.get("saldo_inicial"),
@@ -1168,7 +1226,7 @@ def main():
 
                         # Auto-save immediately to SQLite with persistent document retention
                         if current_file_txs:
-                            save_processed_transactions(
+                            saved_archivo_id = save_processed_transactions(
                                 filename=fname,
                                 file_hash=f_hash,
                                 file_type=ext,
@@ -1185,6 +1243,8 @@ def main():
                                 metricas_json=json.dumps(file_metrics, ensure_ascii=False) if file_metrics else None,
                                 filas_rechazadas=file_filas_rechazadas,
                             )
+                            if fname in st.session_state["reconciliation_reports"]:
+                                st.session_state["reconciliation_reports"][fname]["archivo_id"] = saved_archivo_id
                             mark_checkpoint_file_completed(batch_id, fname)
                             completed_files_set.add(fname)
                             st.toast(f"💾 Guardado en BD y almacenamiento: {len(current_file_txs)} movimientos de {fname}", icon="✅")
@@ -1236,7 +1296,7 @@ def main():
         transactions = st.session_state.get("all_transactions", [])
 
         if transactions:
-            df_all = create_standard_dataframe(transactions)
+            df_all = create_standard_dataframe(transactions, include_audit=True)
             df_ingresos = df_all[df_all["tipo"] == TipoTransaccion.INGRESO.value].copy()
             df_egresos = df_all[df_all["tipo"] == TipoTransaccion.EGRESO.value].copy()
 
@@ -1460,7 +1520,7 @@ def main():
                             key="dl_csv_egresos"
                         )
 
-                    display_egresos = df_egresos.drop(columns=["tipo"], errors="ignore")
+                    display_egresos = df_egresos[["fecha", "concepto", "importe", "descripción"]]
                     st.dataframe(
                         display_egresos,
                         width="stretch",
@@ -1492,7 +1552,7 @@ def main():
                             key="dl_csv_ingresos"
                         )
 
-                    display_ingresos = df_ingresos.drop(columns=["tipo"], errors="ignore")
+                    display_ingresos = df_ingresos[["fecha", "concepto", "importe", "descripción"]]
                     st.dataframe(
                         display_ingresos,
                         width="stretch",
@@ -1512,10 +1572,10 @@ def main():
                 if not df_all.empty:
                     col_t1, col_t2 = st.columns([1, 1])
                     with col_t1:
-                        tsv_all = df_all.to_csv(sep="\t", index=False)
+                        tsv_all = df_to_tsv(df_all)
                         render_clipboard_button(tsv_all, "Copiar Todas las Transacciones", button_id="copy_all")
                     with col_t2:
-                        csv_all = df_all.to_csv(index=False, encoding="utf-8-sig").encode("utf-8-sig")
+                        csv_all = df_to_csv_bytes(df_all)
                         st.download_button(
                             "📥 Descargar Consolidado (.csv)",
                             data=csv_all,
@@ -1524,8 +1584,9 @@ def main():
                             key="dl_csv_all"
                         )
 
+                    display_all = df_all[["fecha", "concepto", "importe", "descripción", "tipo"]]
                     st.dataframe(
-                        df_all,
+                        display_all,
                         width="stretch",
                         column_config={
                             "fecha": st.column_config.TextColumn("Fecha (YYYY-MM-DD)", width="medium"),
@@ -1578,13 +1639,62 @@ def main():
                                     new_tipo = row.get("tipo")
                                     new_imp = row.get("importe")
                                     for t in transactions:
-                                        if getattr(t, "id", None) == row_id or (getattr(t, "fecha", "") == row.get("fecha") and getattr(t, "concepto", "") == row.get("concepto")):
+                                        matches = False
+                                        if row_id is not None and getattr(t, "id", None) is not None:
+                                            matches = (t.id == row_id)
+                                        elif getattr(t, "fecha", "") == row.get("fecha") and getattr(t, "concepto", "") == row.get("concepto"):
+                                            matches = True
+
+                                        if matches:
                                             t.tipo = TipoTransaccion(new_tipo) if isinstance(new_tipo, str) else new_tipo
                                             t.importe = float(new_imp)
                                             t.estado_revision = "VERIFICADO"
                                             t.confianza = 1.0
+
                                 st.session_state["all_transactions"] = transactions
-                                st.success("✅ ¡Correcciones aplicadas! Las transacciones fueron promovidas a VERIFICADO.")
+
+                                # Recalculate reconciliation and persist to SQLite per document
+                                recon_reports = st.session_state.get("reconciliation_reports", {})
+                                for fname, r_info in recon_reports.items():
+                                    arch_id = r_info.get("archivo_id")
+                                    if not arch_id:
+                                        d_files = {f["nombre_archivo"]: f["id"] for f in get_distinct_files()}
+                                        arch_id = d_files.get(fname)
+                                        if arch_id:
+                                            r_info["archivo_id"] = arch_id
+
+                                    doc_bals = r_info.get("doc_balances", {})
+                                    new_recon = reconcile_transactions(
+                                        transactions,
+                                        doc_bals.get("saldo_inicial"),
+                                        doc_bals.get("saldo_final"),
+                                        summary_data=doc_bals
+                                    )
+                                    cob = r_info.get("cobertura", 1.0)
+                                    rechs = r_info.get("filas_rechazadas", [])
+                                    has_saldos = doc_bals.get("saldo_inicial") is not None and doc_bals.get("saldo_final") is not None
+                                    baja_c = sum(1 for tx in transactions if getattr(tx, "confianza", 1.0) < 0.75)
+                                    new_estado = clasificar_estado_documento(
+                                        cuadra=new_recon.cuadra,
+                                        modo_contable=new_recon.modo_contable,
+                                        cobertura=cob,
+                                        filas_rechazadas_count=len(rechs),
+                                        tiene_saldos=has_saldos,
+                                        filas_baja_confianza_count=baja_c
+                                    )
+                                    new_recon.estado_conciliacion = new_estado
+                                    r_info["resultado"] = new_recon
+                                    r_info["estado"] = new_estado
+
+                                    if arch_id:
+                                        update_transaction_review(
+                                            archivo_id=arch_id,
+                                            transactions=transactions,
+                                            recon=new_recon,
+                                            estado_conciliacion=new_estado
+                                        )
+
+                                st.success("✅ ¡Correcciones aplicadas y persistidas en base de datos! Conciliación recalculada.")
                                 st.rerun()
 
                     if all_rechazadas:

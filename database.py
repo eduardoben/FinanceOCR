@@ -20,7 +20,7 @@ from contextlib import contextmanager
 from typing import List, Optional, Dict, Any, Generator
 import pandas as pd
 
-from models import Transaccion, TipoTransaccion
+from models import Transaccion, TipoTransaccion, ReconciliacionResultado
 
 # Canonical storage directory and database location
 DEFAULT_DB_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
@@ -169,6 +169,7 @@ def init_db(db_path: str = DEFAULT_DB_PATH) -> None:
         datos_crudos TEXT,
         motivo TEXT,
         detalle_error TEXT,
+        pagina INTEGER DEFAULT 1,
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
         FOREIGN KEY (archivo_id) REFERENCES archivos_procesados(id) ON DELETE CASCADE
     );
@@ -223,6 +224,14 @@ def init_db(db_path: str = DEFAULT_DB_PATH) -> None:
         ]:
             try:
                 conn.execute(f"ALTER TABLE transacciones ADD COLUMN {col} {col_type};")
+            except sqlite3.OperationalError:
+                pass
+
+        for col, col_type in [
+            ("pagina", "INTEGER DEFAULT 1"),
+        ]:
+            try:
+                conn.execute(f"ALTER TABLE filas_rechazadas ADD COLUMN {col} {col_type};")
             except sqlite3.OperationalError:
                 pass
 
@@ -529,15 +538,31 @@ def save_processed_transactions(
             ))
 
         if tx_rows:
-            conn.executemany(
-                """
-                INSERT INTO transacciones (
-                    archivo_id, fecha, concepto, importe, descripcion, tipo,
-                    confianza, origen, linea_origen, saldo_renglon, estado_revision, pagina
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
-                """,
-                tx_rows
-            )
+            for tx in transactions:
+                tipo_val = tx.tipo.value if hasattr(tx.tipo, "value") else str(tx.tipo)
+                cur = conn.execute(
+                    """
+                    INSERT INTO transacciones (
+                        archivo_id, fecha, concepto, importe, descripcion, tipo,
+                        confianza, origen, linea_origen, saldo_renglon, estado_revision, pagina
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+                    """,
+                    (
+                        archivo_id,
+                        tx.fecha,
+                        tx.concepto,
+                        float(tx.importe),
+                        tx.descripcion,
+                        tipo_val,
+                        float(getattr(tx, "confianza", 1.0)),
+                        str(getattr(tx, "origen", "llm")),
+                        str(getattr(tx, "linea_origen", "")),
+                        float(tx.saldo_renglon) if getattr(tx, "saldo_renglon", None) is not None else None,
+                        str(getattr(tx, "estado_revision", "pendiente")),
+                        int(getattr(tx, "pagina", 1))
+                    )
+                )
+                tx.id = cur.lastrowid
 
         # Batch insert audited rejected rows if provided
         if filas_rechazadas:
@@ -554,13 +579,14 @@ def save_processed_transactions(
                     str(r.get("linea_origen", "")),
                     raw_d,
                     str(r.get("motivo", "rechazo_general")),
-                    str(r.get("detalle_error", ""))
+                    str(r.get("detalle_error", "")),
+                    int(r.get("pagina", 1))
                 ))
             conn.executemany(
                 """
                 INSERT INTO filas_rechazadas (
-                    archivo_id, linea_origen, datos_crudos, motivo, detalle_error
-                ) VALUES (?, ?, ?, ?, ?);
+                    archivo_id, linea_origen, datos_crudos, motivo, detalle_error, pagina
+                ) VALUES (?, ?, ?, ?, ?, ?);
                 """,
                 rech_rows
             )
@@ -586,14 +612,149 @@ def get_filas_rechazadas(
     with db_session(db_path) as conn:
         if archivo_id is not None:
             rows = conn.execute(
-                "SELECT id, archivo_id, linea_origen, datos_crudos, motivo, detalle_error, created_at FROM filas_rechazadas WHERE archivo_id = ? ORDER BY id ASC;",
+                "SELECT id, archivo_id, linea_origen, datos_crudos, motivo, detalle_error, pagina, created_at FROM filas_rechazadas WHERE archivo_id = ? ORDER BY id ASC;",
                 (archivo_id,)
             ).fetchall()
         else:
             rows = conn.execute(
-                "SELECT id, archivo_id, linea_origen, datos_crudos, motivo, detalle_error, created_at FROM filas_rechazadas ORDER BY id DESC LIMIT 500;"
+                "SELECT id, archivo_id, linea_origen, datos_crudos, motivo, detalle_error, pagina, created_at FROM filas_rechazadas ORDER BY id DESC LIMIT 500;"
             ).fetchall()
         return [dict(r) for r in rows]
+
+
+def update_transaction_review(
+    archivo_id: int,
+    transactions: List[Transaccion],
+    recon: ReconciliacionResultado,
+    estado_conciliacion: str,
+    db_path: str = DEFAULT_DB_PATH
+) -> bool:
+    """
+    Actualiza en SQLite las transacciones editadas manualmente en la Cola de Revisión
+    y el estado de conciliación del archivo padre.
+    """
+    init_db(db_path)
+    dates = [tx.fecha for tx in transactions if tx.fecha and str(tx.fecha).strip()]
+    rango_inicio = min(dates) if dates else None
+    rango_fin = max(dates) if dates else None
+    conciliado_int = 1 if recon.cuadra is True else (0 if recon.cuadra is False else None)
+
+    s_ini = float(recon.saldo_inicial) if recon.saldo_inicial is not None else None
+    s_fin = float(recon.saldo_final_esperado if recon.saldo_final_esperado is not None else (recon.saldo_final_declarado or 0.0))
+    diff = float(recon.diferencia) if recon.diferencia is not None else 0.0
+
+    with db_session(db_path) as conn:
+        conn.execute(
+            """
+            UPDATE archivos_procesados SET
+                saldo_inicial = ?,
+                saldo_final = ?,
+                diferencia_conciliacion = ?,
+                conciliado = ?,
+                estado_conciliacion = ?,
+                total_transacciones = ?,
+                rango_fecha_inicio = ?,
+                rango_fecha_fin = ?
+            WHERE id = ?;
+            """,
+            (
+                s_ini,
+                s_fin,
+                diff,
+                conciliado_int,
+                estado_conciliacion,
+                len(transactions),
+                rango_inicio,
+                rango_fin,
+                archivo_id
+            )
+        )
+
+        has_any_id = any(getattr(tx, "id", None) is not None for tx in transactions)
+        if has_any_id:
+            for tx in transactions:
+                tx_id = getattr(tx, "id", None)
+                tipo_val = tx.tipo.value if hasattr(tx.tipo, "value") else str(tx.tipo)
+                if tx_id is not None:
+                    conn.execute(
+                        """
+                        UPDATE transacciones SET
+                            fecha = ?, concepto = ?, importe = ?, descripcion = ?, tipo = ?,
+                            confianza = ?, origen = ?, linea_origen = ?, saldo_renglon = ?,
+                            estado_revision = ?, pagina = ?
+                        WHERE id = ? AND archivo_id = ?;
+                        """,
+                        (
+                            tx.fecha,
+                            tx.concepto,
+                            float(tx.importe),
+                            tx.descripcion,
+                            tipo_val,
+                            float(getattr(tx, "confianza", 1.0)),
+                            str(getattr(tx, "origen", "llm")),
+                            str(getattr(tx, "linea_origen", "")),
+                            float(tx.saldo_renglon) if getattr(tx, "saldo_renglon", None) is not None else None,
+                            str(getattr(tx, "estado_revision", "VERIFICADO")),
+                            int(getattr(tx, "pagina", 1)),
+                            tx_id,
+                            archivo_id
+                        )
+                    )
+                else:
+                    cur = conn.execute(
+                        """
+                        INSERT INTO transacciones (
+                            archivo_id, fecha, concepto, importe, descripcion, tipo,
+                            confianza, origen, linea_origen, saldo_renglon, estado_revision, pagina
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+                        """,
+                        (
+                            archivo_id,
+                            tx.fecha,
+                            tx.concepto,
+                            float(tx.importe),
+                            tx.descripcion,
+                            tipo_val,
+                            float(getattr(tx, "confianza", 1.0)),
+                            str(getattr(tx, "origen", "llm")),
+                            str(getattr(tx, "linea_origen", "")),
+                            float(tx.saldo_renglon) if getattr(tx, "saldo_renglon", None) is not None else None,
+                            str(getattr(tx, "estado_revision", "VERIFICADO")),
+                            int(getattr(tx, "pagina", 1))
+                        )
+                    )
+                    tx.id = cur.lastrowid
+        else:
+            conn.execute("DELETE FROM transacciones WHERE archivo_id = ?;", (archivo_id,))
+            tx_rows = []
+            for tx in transactions:
+                tipo_val = tx.tipo.value if hasattr(tx.tipo, "value") else str(tx.tipo)
+                tx_rows.append((
+                    archivo_id,
+                    tx.fecha,
+                    tx.concepto,
+                    float(tx.importe),
+                    tx.descripcion,
+                    tipo_val,
+                    float(getattr(tx, "confianza", 1.0)),
+                    str(getattr(tx, "origen", "llm")),
+                    str(getattr(tx, "linea_origen", "")),
+                    float(tx.saldo_renglon) if getattr(tx, "saldo_renglon", None) is not None else None,
+                    str(getattr(tx, "estado_revision", "VERIFICADO")),
+                    int(getattr(tx, "pagina", 1))
+                ))
+            if tx_rows:
+                conn.executemany(
+                    """
+                    INSERT INTO transacciones (
+                        archivo_id, fecha, concepto, importe, descripcion, tipo,
+                        confianza, origen, linea_origen, saldo_renglon, estado_revision, pagina
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+                    """,
+                    tx_rows
+                )
+
+    return True
 
 
 def query_transactions(

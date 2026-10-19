@@ -18,7 +18,7 @@ import tempfile
 import unittest
 import pandas as pd
 
-from models import Transaccion, TipoTransaccion
+from models import Transaccion, TipoTransaccion, ReconciliacionResultado
 from database import (
     db_session,
     init_db,
@@ -40,6 +40,7 @@ from database import (
     get_db_connection,
     get_filas_rechazadas,
     _INITIALIZED_DBS,
+    update_transaction_review,
 )
 
 
@@ -826,6 +827,73 @@ class TestDatabaseLayer(unittest.TestCase):
                 self.assertIn("filas_rechazadas", tables)
         finally:
             legacy_dir.cleanup()
+
+    def test_update_transaction_review(self):
+        """Verifica que update_transaction_review actualice importe, tipo y estado de revisión en SQLite."""
+        fname = "estado_revision.pdf"
+        fhash = compute_file_hash(b"content to review")
+        tx1 = Transaccion(
+            fecha="2024-05-10",
+            concepto="CARGO DUDOSO",
+            importe=150.0,
+            descripcion="CARGO DUDOSO SIN CONFIRMAR",
+            tipo=TipoTransaccion.EGRESO,
+            estado_revision="REVISAR",
+            confianza=0.55
+        )
+        archivo_id = save_processed_transactions(
+            filename=fname,
+            file_hash=fhash,
+            file_type="pdf",
+            transactions=[tx1],
+            saldo_inicial=5000.0,
+            saldo_final=4850.0,
+            estado_conciliacion="REVISAR",
+            db_path=self.db_path
+        )
+        self.assertIsNotNone(archivo_id)
+        self.assertIsNotNone(tx1.id)
+
+        # Edit transaction: change to INGRESO, amount 250.0, estado_revision VERIFICADO
+        tx1.tipo = TipoTransaccion.INGRESO
+        tx1.importe = 250.0
+        tx1.estado_revision = "VERIFICADO"
+        tx1.confianza = 1.0
+
+        recon = ReconciliacionResultado(
+            saldo_inicial=5000.0,
+            saldo_final_esperado=5250.0,
+            saldo_final_declarado=5250.0,
+            total_ingresos=250.0,
+            total_egresos=0.0,
+            diferencia=0.0,
+            cuadra=True,
+            conciliado=True,
+            modo_contable="debito"
+        )
+
+        success = update_transaction_review(
+            archivo_id=archivo_id,
+            transactions=[tx1],
+            recon=recon,
+            estado_conciliacion="VERIFICADO",
+            db_path=self.db_path
+        )
+        self.assertTrue(success)
+
+        # Query updated records
+        df = query_transactions(archivo_id=archivo_id, db_path=self.db_path)
+        self.assertEqual(len(df), 1)
+        self.assertEqual(df.iloc[0]["tipo"], "ingreso")
+        self.assertEqual(df.iloc[0]["importe"], 250.0)
+        self.assertEqual(df.iloc[0]["estado_revision"], "VERIFICADO")
+        self.assertEqual(df.iloc[0]["confianza"], 1.0)
+
+        # Verify parent statement status
+        stored = check_file_processed(fname, fhash, db_path=self.db_path)
+        self.assertIsNotNone(stored)
+        self.assertEqual(stored["estado_conciliacion"], "VERIFICADO")
+        self.assertEqual(stored["conciliado"], 1)
 
 
 if __name__ == "__main__":

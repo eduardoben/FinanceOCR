@@ -662,6 +662,53 @@ class TestDataValidationAndIntegrity(unittest.TestCase):
         self.assertEqual(compute_row_confidence(tx_out_period, cadena_ok=None, acuerdo_senales=True, fecha_en_periodo=False), 0.65)
         self.assertEqual(tx_out_period.estado_revision, "REVISAR")
 
+    def test_normalizar_tipo_transaccion_outflow_priority_and_inflows(self):
+        """Verifica que pagos a terceros/servicios sean EGRESO y solo abonos explícitos sean INGRESO."""
+        # Outflows containing 'pago' or expense terms
+        self.assertEqual(normalizar_tipo_transaccion("pago de servicio"), "EGRESO")
+        self.assertEqual(normalizar_tipo_transaccion("pago servicio cfe"), "EGRESO")
+        self.assertEqual(normalizar_tipo_transaccion("pago tarjeta credito"), "EGRESO")
+        self.assertEqual(normalizar_tipo_transaccion("pago de tarjeta"), "EGRESO")
+        self.assertEqual(normalizar_tipo_transaccion("pago a juan perez"), "EGRESO")
+        self.assertEqual(normalizar_tipo_transaccion("cargo por comision"), "EGRESO")
+        self.assertEqual(normalizar_tipo_transaccion("compra pos oxxo"), "EGRESO")
+        self.assertEqual(normalizar_tipo_transaccion("retiro cajero atm"), "EGRESO")
+        self.assertEqual(normalizar_tipo_transaccion("spei enviado a banco"), "EGRESO")
+
+        # Inflows with explicit receipt indicators
+        self.assertEqual(normalizar_tipo_transaccion("su pago gracias"), "INGRESO")
+        self.assertEqual(normalizar_tipo_transaccion("pago recibido"), "INGRESO")
+        self.assertEqual(normalizar_tipo_transaccion("abono de nómina"), "INGRESO")
+        self.assertEqual(normalizar_tipo_transaccion("deposito en efectivo"), "INGRESO")
+        self.assertEqual(normalizar_tipo_transaccion("ingreso por traspaso"), "INGRESO")
+
+    def test_process_candidate_tx_dict_preserves_audit_fields(self):
+        """Verifica que _process_candidate_tx_dict preserve saldo_renglon, linea_origen, pagina y concepto."""
+        from llm_client import _process_candidate_tx_dict
+        cand = {
+            "fecha": "2024-03-15",
+            "concepto": "LIVERPOOL",
+            "descripcion": "COMPRA EN TIENDA",
+            "importe": 1250.75,
+            "tipo": "egreso",
+            "referencia": "REF-9988",
+            "saldo_renglon": "45200.50",
+            "linea_origen": "15/03/2024 LIVERPOOL REF-9988 $1,250.75 $45,200.50",
+            "pagina": 3,
+        }
+        tx = _process_candidate_tx_dict(cand, statement_year=2024)
+        self.assertIsNotNone(tx)
+        self.assertEqual(tx.fecha, "2024-03-15")
+        self.assertEqual(tx.concepto, "LIVERPOOL")
+        self.assertEqual(tx.importe, 1250.75)
+        self.assertEqual(tx.tipo, TipoTransaccion.EGRESO)
+        self.assertIn("REF-9988", tx.descripcion)
+        self.assertEqual(tx.saldo_renglon, 45200.50)
+        self.assertEqual(tx.linea_origen, "15/03/2024 LIVERPOOL REF-9988 $1,250.75 $45,200.50")
+        self.assertEqual(tx.pagina, 3)
+        self.assertEqual(tx.origen, "llm")
+        self.assertIsNotNone(tx.confianza)
+
 
 if __name__ == "__main__":
     unittest.main()

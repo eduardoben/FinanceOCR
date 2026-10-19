@@ -284,11 +284,34 @@ def parse_pdf(
     if effective_page_range:
         result = converter.convert(file_path, page_range=effective_page_range)
         pages_processed = effective_page_range[1] - effective_page_range[0] + 1
+        page_start = effective_page_range[0]
+        page_end = effective_page_range[1]
     else:
         result = converter.convert(file_path)
         pages_processed = total_pages
+        page_start = 1
+        page_end = total_pages
 
-    markdown_output = result.document.export_to_markdown()
+    markdown_pages = []
+    has_page_content = False
+    for p in range(page_start, page_end + 1):
+        try:
+            page_md = result.document.export_to_markdown(page_no=p)
+            if page_md and page_md.strip():
+                has_page_content = True
+        except Exception:
+            page_md = ""
+        markdown_pages.append(f"<!-- page: {p} -->\n{page_md}")
+
+    if has_page_content:
+        markdown_output = "\n\n".join(markdown_pages)
+    else:
+        full_md = result.document.export_to_markdown()
+        if "<!-- page:" in full_md.lower():
+            markdown_output = full_md
+        else:
+            markdown_output = f"<!-- page: {page_start} -->\n{full_md}"
+
     elapsed_seconds = round(time.time() - start_time, 2)
 
     metadata = {
@@ -1353,17 +1376,18 @@ def infer_statement_mode(
 
     # 1. Indicadores textuales de crédito
     credit_indicators = [
-        "límite de crédito", "limite de credito", "crédito disponible", "credito disponible",
-        "línea de crédito", "linea de credito",
-        "pago para no generar intereses", "pago minimo", "pago mínimo",
-        "saldo deudor total", "saldo deudor", "tarjeta de crédito", "tarjeta de credito",
-        "tarjeta", "pago tarjeta", "compras y disposiciones"
+        "tarjeta de crédito", "tarjeta de credito",
+        "límite de crédito", "limite de credito",
+        "pago para no generar intereses",
+        "pago mínimo", "pago minimo",
+        "saldo deudor total", "saldo deudor"
     ]
     credit_score = sum(1 for ind in credit_indicators if ind in raw_text)
 
     # 2. Indicadores textuales de débito
     debit_indicators = [
         "cuenta de cheques", "cuenta cheques", "cuenta de débito", "cuenta de debito",
+        "tarjeta de débito", "tarjeta de debito", "compras con tarjeta",
         "clabe", "clabe interbancaria", "saldo promedio", "saldo disponible",
         "depósito nómina", "deposito nomina", "retiro en cajero", "retiro cajero", "cajero automático"
     ]
@@ -1946,6 +1970,64 @@ def reextract_pages_high_res(
         elapsed_seconds=elapsed,
         memory_mb=mem_used,
         pages_count=len(page_numbers)
+    )
+
+    return result_pages
+
+
+def reextract_pages_vlm(
+    pdf_path: str,
+    page_numbers: List[int],
+    base_url: str = "http://localhost:11434",
+    model: str = "qwen3-vl:4b",
+    statement_year: Optional[int] = None
+) -> Dict[int, List[Transaccion]]:
+    """
+    Re-extracción visual dirigida mediante modelo multimodal VLM (qwen3-vl:4b).
+    Renderiza cada página dudosa en alta resolución (scale=2.5) y extrae las transacciones
+    directamente de la imagen visual. Registra la métrica en telemetry.py bajo 'vlm_verification_pass'.
+    """
+    if not page_numbers or not os.path.exists(pdf_path):
+        return {}
+
+    start_time = time.time()
+    try:
+        import psutil
+        proc = psutil.Process()
+        mem_before = proc.memory_info().rss / (1024 * 1024)
+    except Exception:
+        mem_before = 0.0
+
+    from llm_client import extract_page_transactions_vlm
+    result_pages: Dict[int, List[Transaccion]] = {}
+
+    for p in sorted(set(page_numbers)):
+        try:
+            page_img = render_pdf_page_image(pdf_path, page_number=p, scale=2.5)
+            txs = extract_page_transactions_vlm(
+                page_image=page_img,
+                page_number=p,
+                statement_year=statement_year,
+                base_url=base_url,
+                model=model
+            )
+            result_pages[p] = txs
+        except Exception:
+            result_pages[p] = []
+
+    elapsed = round(time.time() - start_time, 2)
+    try:
+        mem_after = proc.memory_info().rss / (1024 * 1024)
+        mem_used = max(0.0, mem_after - mem_before)
+    except Exception:
+        mem_used = 0.0
+
+    from telemetry import record_high_res_verification
+    record_high_res_verification(
+        elapsed_seconds=elapsed,
+        memory_mb=mem_used,
+        pages_count=len(page_numbers),
+        stage_name="vlm_verification_pass"
     )
 
     return result_pages

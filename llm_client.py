@@ -6,10 +6,14 @@ the requested model (e.g. gemma4:12b) with zero telemetry and zero external netw
 Enforces JSON Schema validation via Pydantic and handles Spanish banking context.
 """
 
+import io
+import os
 import json
 import time
+import base64
 from typing import List, Tuple, Optional, Dict, Any, Union
 import httpx
+from PIL import Image
 from pydantic import ValidationError
 
 from models import (
@@ -18,9 +22,11 @@ from models import (
     TransaccionesResponse,
     TransaccionPlana,
     LLMTransaccionesList,
+    VLMBalancesSchema,
     normalizar_tipo_transaccion,
     auditar_fila_rechazada,
     calcular_metricas_captura,
+    compute_row_confidence,
 )
 from date_utils import normalize_spanish_date, extract_statement_year
 
@@ -41,16 +47,21 @@ REGLAS CRÍTICAS DE EXTRACCIÓN Y CLASIFICACIÓN:
 2. REGLA DE EXCLUSIÓN ESTRICTA:
    - IGNORA por completo saldos informativos y totales de resumen: Saldo inicial, saldo anterior, saldo final, saldo actual, saldo promedio, límite de crédito, crédito disponible, pago para no generar intereses, pago mínimo, totales ("Total cargos", "Total abonos", etc.). NO los incluyas como transacciones.
 
-3. NORMALIZACIÓN DE CAMPOS:
+3. NORMALIZACIÓN DE CAMPOS (deben coincidir exactamente con el esquema TransaccionPlana):
    - 'fecha': Fecha de la transacción en formato YYYY-MM-DD (ejemplo: si dice '15/ENE/2024', conviértela a '2024-01-15').
-   - 'concepto': Nombre limpio y descriptivo del comercio o beneficiario (ejemplo: "Walmart", "CFE", "Amazon", "Caffenio", "Pago Nómina").
+   - 'concepto': Nombre corto y limpio del comercio, entidad o concepto principal (ejemplo: "Walmart", "CFE", "Amazon", "Pago Nómina").
+   - 'descripcion': Detalles completos originales de la línea o renglón.
    - 'importe': Número decimal positivo sin signo, sin símbolo de moneda ni comas (ejemplo: 1250.50).
-   - 'descripcion': Detalles completos originales de la línea.
+   - 'tipo': 'ingreso' o 'egreso'.
+   - 'referencia': Folio, número de autorización, clave de rastreo SPEI o referencia bancaria (o cadena vacía si no existe).
+   - 'saldo_renglon': Saldo numérico posterior al movimiento reportado en el renglón (o null si no existe).
+   - 'linea_origen': Texto crudo o renglón original correspondiente del documento.
+   - 'pagina': Número de página donde se ubica el movimiento (entero >= 1).
 
 4. DIRECTIVA DE EJECUCIÓN:
    - Sé directo, conciso y estructurado. No generes deliberaciones extensas.
    - Devuelve únicamente el objeto JSON solicitado con el formato:
-     {"transacciones": [{"fecha": "YYYY-MM-DD", "concepto": "...", "importe": 0.0, "tipo": "egreso", "descripcion": "..."}]}
+     {"transacciones": [{"fecha": "YYYY-MM-DD", "concepto": "...", "descripcion": "...", "importe": 0.0, "tipo": "egreso", "referencia": "...", "saldo_renglon": null, "linea_origen": "...", "pagina": 1}]}
 """
 
 DATE_PATTERN = re.compile(
@@ -228,9 +239,10 @@ import re
 
 def _process_candidate_tx_dict(
     item: Any,
-    out_list: List[Transaccion],
-    filas_rechazadas: Optional[List[Dict[str, Any]]] = None
-):
+    out_list: Optional[List[Transaccion]] = None,
+    filas_rechazadas: Optional[List[Dict[str, Any]]] = None,
+    statement_year: Optional[int] = None
+) -> Optional[Transaccion]:
     if not isinstance(item, dict):
         if filas_rechazadas is not None:
             filas_rechazadas.append(auditar_fila_rechazada(
@@ -239,7 +251,7 @@ def _process_candidate_tx_dict(
                 motivo="validacion_esquema",
                 detalle_error="El registro no es un diccionario JSON"
             ))
-        return
+        return None
 
     linea_origen = str(item.get("linea_origen") or item.get("descripcion") or item.get("concepto") or item)
     raw_fecha = str(item.get("fecha") or "")
@@ -247,6 +259,10 @@ def _process_candidate_tx_dict(
     raw_tipo = str(item.get("tipo") or "")
     raw_desc = str(item.get("descripcion") or item.get("concepto") or "")
     raw_concepto = str(item.get("concepto") or raw_desc[:30] or "Transaccion")
+    raw_ref = str(item.get("referencia") or "").strip()
+    raw_saldo = item.get("saldo_renglon")
+    raw_pagina = item.get("pagina")
+    origen = str(item.get("origen") or "llm")
 
     # 1. Validar fecha
     if not raw_fecha.strip():
@@ -257,9 +273,9 @@ def _process_candidate_tx_dict(
                 motivo="fecha_invalida",
                 detalle_error="Fecha no especificada o vacía"
             ))
-        return
+        return None
 
-    norm_fecha = normalize_spanish_date(raw_fecha)
+    norm_fecha = normalize_spanish_date(raw_fecha, default_year=statement_year)
     if not norm_fecha or not re.match(r"^\d{4}-\d{2}-\d{2}$", norm_fecha):
         if filas_rechazadas is not None:
             filas_rechazadas.append(auditar_fila_rechazada(
@@ -285,16 +301,39 @@ def _process_candidate_tx_dict(
     # 3. Normalizar tipo antes de instanciar Transaccion
     norm_tipo = normalizar_tipo_transaccion(raw_tipo)
 
-    # 4. Validar e instanciar Transaccion
+    # 4. Sanitizar saldo_renglon
+    saldo_renglon = None
+    if raw_saldo is not None and str(raw_saldo).strip() not in ("", "null", "None"):
+        saldo_renglon = Transaccion.sanitize_importe(raw_saldo, keep_sign=True)
+
+    # 5. Concatenar referencia en descripcion si no está incluida
+    descripcion = raw_desc.strip() or raw_concepto.strip()
+    if raw_ref and raw_ref.lower() not in descripcion.lower():
+        descripcion = f"{descripcion} | Ref: {raw_ref}".strip()
+
+    # 6. Página (entero >= 1)
+    try:
+        pagina = max(1, int(raw_pagina)) if raw_pagina is not None else 1
+    except (ValueError, TypeError):
+        pagina = 1
+
+    # 7. Validar e instanciar Transaccion
     try:
         tx = Transaccion(
             fecha=norm_fecha,
             concepto=raw_concepto.strip() or "Movimiento",
             importe=amt,
-            descripcion=raw_desc.strip() or raw_concepto.strip(),
-            tipo=norm_tipo
+            descripcion=descripcion,
+            tipo=norm_tipo,
+            saldo_renglon=saldo_renglon,
+            linea_origen=linea_origen,
+            pagina=pagina,
+            origen=origen
         )
-        out_list.append(tx)
+        compute_row_confidence(tx, cadena_ok=None)
+        if out_list is not None:
+            out_list.append(tx)
+        return tx
     except ValidationError as e:
         if filas_rechazadas is not None:
             filas_rechazadas.append(auditar_fila_rechazada(
@@ -303,6 +342,7 @@ def _process_candidate_tx_dict(
                 motivo="validacion_esquema",
                 detalle_error=str(e)
             ))
+        return None
     except Exception as e:
         if filas_rechazadas is not None:
             filas_rechazadas.append(auditar_fila_rechazada(
@@ -311,6 +351,7 @@ def _process_candidate_tx_dict(
                 motivo="validacion_esquema",
                 detalle_error=str(e)
             ))
+        return None
 
 
 def clean_and_parse_llm_json(
@@ -601,7 +642,7 @@ def deduplicate_all_chunks(
 def extract_transactions_with_ollama(
     text_content: str,
     base_url: str = "http://localhost:11434",
-    model: str = "gemma4:12b",
+    model: str = "qwen3-vl:4b",
     num_ctx: int = 8192,
     timeout_seconds: float = 180.0,
     filas_rechazadas_out: Optional[List[Dict[str, Any]]] = None,
@@ -797,5 +838,193 @@ def reconcile_extraction_passes(*args, **kwargs):
     """Reconciles extraction passes (forwarded to parsers.reconcile_extraction_passes)."""
     from parsers import reconcile_extraction_passes as _rep
     return _rep(*args, **kwargs)
+
+
+def encode_pil_image_base64(image: Image.Image, format: str = "PNG") -> str:
+    """
+    Convierte una imagen PIL a Base64 sin encabezados data-URI.
+    """
+    buffered = io.BytesIO()
+    image.save(buffered, format=format)
+    return base64.b64encode(buffered.getvalue()).decode("utf-8")
+
+
+def _to_base64_image(page_image: Union[Image.Image, bytes, str]) -> str:
+    """Helper to convert page_image (PIL, bytes, path or base64 str) into raw base64 string."""
+    if isinstance(page_image, str):
+        if os.path.exists(page_image):
+            img = Image.open(page_image)
+            return encode_pil_image_base64(img)
+        if page_image.startswith("data:image"):
+            return page_image.split(",", 1)[-1].strip()
+        return page_image.strip()
+    elif isinstance(page_image, bytes):
+        return base64.b64encode(page_image).decode("utf-8")
+    elif isinstance(page_image, Image.Image):
+        return encode_pil_image_base64(page_image)
+    raise TypeError(f"Tipo de imagen no soportado: {type(page_image)}")
+
+
+def extract_page_transactions_vlm(
+    page_image: Union[Image.Image, bytes, str],
+    page_number: int = 1,
+    statement_year: Optional[int] = None,
+    base_url: str = "http://localhost:11434",
+    model: str = "qwen3-vl:4b",
+    num_ctx: int = 8192,
+    timeout_seconds: float = 180.0,
+    filas_rechazadas_out: Optional[List[Dict[str, Any]]] = None
+) -> List[Transaccion]:
+    """
+    Extrae transacciones financieras directamente de la imagen visual de una página
+    utilizando el modelo multimodal qwen3-vl:4b vía Ollama (/api/chat).
+    """
+    clean_url = base_url.rstrip("/")
+    b64_img = _to_base64_image(page_image)
+
+    user_text = (
+        f"Analiza cuidadosamente la imagen de la página {page_number} del estado de cuenta bancario. "
+        "Extrae de forma exhaustiva y determinista cada transacción financiera individual en la tabla o listado de movimientos."
+    )
+    if statement_year:
+        user_text += f"\nContexto del documento: Año del estado de cuenta = {statement_year}."
+
+    payload = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {
+                "role": "user",
+                "content": user_text,
+                "images": [b64_img]
+            }
+        ],
+        "stream": False,
+        "format": LLMTransaccionesList.model_json_schema(),
+        "options": {
+            "temperature": 0.0,
+            "num_ctx": num_ctx,
+            "num_predict": num_ctx
+        }
+    }
+
+    try:
+        with httpx.Client(timeout=timeout_seconds) as client:
+            response = client.post(f"{clean_url}/api/chat", json=payload)
+            response.raise_for_status()
+            data = response.json()
+            msg = data.get("message", {})
+            raw_content = msg.get("content", "")
+            thinking = msg.get("thinking", "")
+
+        txs = clean_and_parse_llm_json(raw_content, thinking_content=thinking, filas_rechazadas=filas_rechazadas_out)
+
+        processed_txs: List[Transaccion] = []
+        for tx in txs:
+            tx.pagina = int(page_number)
+            tx.origen = "vlm_qwen3"
+            if statement_year and tx.fecha:
+                tx.fecha = normalize_spanish_date(tx.fecha, default_year=statement_year)
+            compute_row_confidence(tx, cadena_ok=None)
+            processed_txs.append(tx)
+
+        return processed_txs
+
+    except Exception as e:
+        print(f"[VLM] Error durante la extracción de la página {page_number} con {model}: {e}")
+        if filas_rechazadas_out is not None:
+            filas_rechazadas_out.append(auditar_fila_rechazada(
+                linea_origen=f"Página {page_number} VLM",
+                datos_crudos=str(e),
+                motivo="error_vlm",
+                detalle_error=str(e)
+            ))
+        return []
+
+
+def extract_balances_vlm(
+    page_image: Union[Image.Image, bytes, str],
+    base_url: str = "http://localhost:11434",
+    model: str = "qwen3-vl:4b"
+) -> Dict[str, Optional[float]]:
+    """
+    Extrae visualmente los saldos (inicial, final, total cargos, total abonos y modo sugerido)
+    a partir de la imagen de la página (típicamente la página 1) usando qwen3-vl:4b.
+    """
+    clean_url = base_url.rstrip("/")
+    b64_img = _to_base64_image(page_image)
+
+    user_text = (
+        "Analiza el cuadro de resumen de saldos y cifras de control en esta página del estado de cuenta bancario. "
+        "Extrae con precisión: saldo_inicial (saldo anterior), saldo_final (nuevo saldo o saldo actual), "
+        "total_cargos (egresos acumulados), total_abonos (ingresos/pagos acumulados) y modo_sugerido ('debito' o 'credito')."
+    )
+
+    payload = {
+        "model": model,
+        "messages": [
+            {
+                "role": "system",
+                "content": (
+                    "Eres un auditor contable experto. Extrae los saldos de resumen del estado de cuenta en formato JSON estricto "
+                    "según el esquema indicado. Si algún saldo no está presente, devuelve null."
+                )
+            },
+            {
+                "role": "user",
+                "content": user_text,
+                "images": [b64_img]
+            }
+        ],
+        "stream": False,
+        "format": VLMBalancesSchema.model_json_schema(),
+        "options": {
+            "temperature": 0.0,
+            "num_ctx": 4096
+        }
+    }
+
+    balances_res: Dict[str, Optional[float]] = {
+        "saldo_inicial": None,
+        "saldo_final": None,
+        "total_cargos": None,
+        "total_abonos": None,
+        "modo_sugerido": "debito"
+    }
+
+    try:
+        with httpx.Client(timeout=120.0) as client:
+            response = client.post(f"{clean_url}/api/chat", json=payload)
+            response.raise_for_status()
+            data = response.json()
+            msg = data.get("message", {})
+            raw_content = msg.get("content", "")
+            thinking = msg.get("thinking", "")
+
+        candidate = (raw_content or "").strip()
+        if not candidate and thinking:
+            candidate = thinking.strip()
+        candidate = re.sub(r"<think>[\s\S]*?</think>", "", candidate).strip()
+        if "```" in candidate:
+            m = re.search(r"```(?:json)?\s*([\s\S]*?)\s*```", candidate)
+            if m:
+                candidate = m.group(1).strip()
+        m_obj = re.search(r"(\{[\s\S]*\})", candidate)
+        if m_obj:
+            candidate = m_obj.group(1).strip()
+
+        parsed = json.loads(candidate)
+        if isinstance(parsed, dict):
+            for k in ["saldo_inicial", "saldo_final", "total_cargos", "total_abonos"]:
+                val = parsed.get(k)
+                if val is not None:
+                    balances_res[k] = Transaccion.sanitize_importe(val, keep_sign=True)
+            if parsed.get("modo_sugerido"):
+                balances_res["modo_sugerido"] = str(parsed["modo_sugerido"]).lower()
+        return balances_res
+
+    except Exception as e:
+        print(f"[VLM Balances] Error al extraer saldos con {model}: {e}")
+        return balances_res
 
 

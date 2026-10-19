@@ -27,6 +27,7 @@ from parsers import (
     identify_low_confidence_pages,
     reextract_pages_high_res,
     reconcile_extraction_passes,
+    reextract_pages_vlm,
 )
 from models import Transaccion, TipoTransaccion, compute_row_confidence
 from llm_client import (
@@ -36,6 +37,9 @@ from llm_client import (
     parse_strict_llm_json,
     parse_heuristic_fallback,
     extract_transactions_with_ollama,
+    extract_page_transactions_vlm,
+    extract_balances_vlm,
+    encode_pil_image_base64,
     is_candidate_row,
     evaluar_linea_candidata,
 )
@@ -549,6 +553,106 @@ startxref
         self.assertEqual(reconciled_disc[0].estado_revision, "DISCREPANCIA_OCR")
         self.assertLessEqual(reconciled_disc[0].confianza, 0.40)
         self.assertIn("[Discrepancia Pass 2:", reconciled_disc[0].descripcion)
+
+    @patch("httpx.Client.post")
+    def test_vlm_extraction_qwen3_payload_and_parsing(self, mock_post):
+        """Verifica que extract_page_transactions_vlm envíe qwen3-vl:4b con imágenes en Base64 y asigne origen vlm_qwen3."""
+        # Mock httpx response
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = {
+            "message": {
+                "content": json.dumps({
+                    "transacciones": [
+                        {
+                            "fecha": "2024-04-12",
+                            "concepto": "FARMACIA GUADALAJARA",
+                            "descripcion": "COMPRA MEDICAMENTO",
+                            "importe": 320.50,
+                            "tipo": "egreso",
+                            "referencia": "REF-7711",
+                            "saldo_renglon": 18500.00,
+                            "linea_origen": "12/04/2024 FARMACIA $320.50 $18,500.00",
+                            "pagina": 2
+                        }
+                    ]
+                })
+            }
+        }
+        mock_post.return_value = mock_resp
+
+        test_img = Image.new("RGB", (80, 80), color="white")
+        txs = extract_page_transactions_vlm(
+            page_image=test_img,
+            page_number=2,
+            statement_year=2024,
+            model="qwen3-vl:4b"
+        )
+
+        # Assertions on HTTP request payload
+        self.assertTrue(mock_post.called)
+        sent_json = mock_post.call_args[1]["json"]
+        self.assertEqual(sent_json["model"], "qwen3-vl:4b")
+        messages = sent_json.get("messages", [])
+        self.assertEqual(len(messages), 2)
+        user_msg = messages[1]
+        self.assertEqual(user_msg["role"], "user")
+        self.assertIn("images", user_msg)
+        self.assertEqual(len(user_msg["images"]), 1)
+        img_b64 = user_msg["images"][0]
+        self.assertFalse(img_b64.startswith("data:"))
+        self.assertGreater(len(img_b64), 20)
+
+        # Assertions on returned transactions
+        self.assertEqual(len(txs), 1)
+        tx = txs[0]
+        self.assertEqual(tx.origen, "vlm_qwen3")
+        self.assertEqual(tx.pagina, 2)
+        self.assertEqual(tx.concepto, "FARMACIA GUADALAJARA")
+        self.assertEqual(tx.importe, 320.50)
+        self.assertEqual(tx.tipo, TipoTransaccion.EGRESO)
+        self.assertEqual(tx.saldo_renglon, 18500.00)
+        self.assertEqual(tx.fecha, "2024-04-12")
+
+    @patch("httpx.Client.post")
+    def test_vlm_balances_extraction_qwen3(self, mock_post):
+        """Verifica que extract_balances_vlm extraiga saldos visualmente con qwen3-vl:4b y schema VLMBalancesSchema."""
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = {
+            "message": {
+                "content": json.dumps({
+                    "saldo_inicial": 25000.00,
+                    "saldo_final": 21500.00,
+                    "total_cargos": 3500.00,
+                    "total_abonos": 0.00,
+                    "modo_sugerido": "debito"
+                })
+            }
+        }
+        mock_post.return_value = mock_resp
+
+        test_img = Image.new("RGB", (80, 80), color="blue")
+        balances = extract_balances_vlm(
+            page_image=test_img,
+            model="qwen3-vl:4b"
+        )
+
+        self.assertTrue(mock_post.called)
+        sent_json = mock_post.call_args[1]["json"]
+        self.assertEqual(sent_json["model"], "qwen3-vl:4b")
+        messages = sent_json.get("messages", [])
+        self.assertEqual(len(messages), 2)
+        user_msg = messages[1]
+        self.assertEqual(user_msg["role"], "user")
+        self.assertIn("images", user_msg)
+        self.assertEqual(len(user_msg["images"]), 1)
+
+        self.assertEqual(balances["saldo_inicial"], 25000.00)
+        self.assertEqual(balances["saldo_final"], 21500.00)
+        self.assertEqual(balances["total_cargos"], 3500.00)
+        self.assertEqual(balances["total_abonos"], 0.00)
+        self.assertEqual(balances["modo_sugerido"], "debito")
 
 
 if __name__ == "__main__":

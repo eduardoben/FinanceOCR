@@ -19,25 +19,53 @@ from parsers import infer_statement_mode
 
 
 
-def create_standard_dataframe(transactions: list) -> pd.DataFrame:
+AUDIT_COLUMNS = [
+    "id", "pagina", "fecha", "concepto", "importe", "descripción",
+    "tipo", "saldo_renglon", "confianza", "origen", "estado_revision", "linea_origen"
+]
+AUDIT_COLS_TO_DROP = [
+    "id", "pagina", "confianza", "origen", "estado_revision",
+    "linea_origen", "saldo_renglon", "tipo"
+]
+
+
+def create_standard_dataframe(transactions: list, include_audit: bool = False) -> pd.DataFrame:
     """
-    Normalizes a list of Transaccion models into a clean pandas DataFrame
-    with canonical column names: fecha, concepto, importe, descripción, tipo.
+    Normalizes a list of Transaccion models into a clean pandas DataFrame.
+    If include_audit is False (default), returns the 5 canonical columns:
+    [fecha, concepto, importe, descripción, tipo].
+    If include_audit is True, returns extended audit columns including
+    [id, pagina, fecha, concepto, importe, descripción, tipo, saldo_renglon, confianza, origen, estado_revision, linea_origen].
     """
     if not transactions:
-        return pd.DataFrame(columns=["fecha", "concepto", "importe", "descripción", "tipo"])
+        cols = AUDIT_COLUMNS if include_audit else ["fecha", "concepto", "importe", "descripción", "tipo"]
+        return pd.DataFrame(columns=cols)
 
     records = []
     for tx in transactions:
-        records.append({
+        tipo_str = tx.tipo.value if hasattr(tx.tipo, "value") else str(tx.tipo)
+        rec = {
             "fecha": tx.fecha,
             "concepto": tx.concepto,
             "importe": round(float(tx.importe), 2),
             "descripción": tx.descripcion,
-            "tipo": tx.tipo.value if hasattr(tx.tipo, "value") else str(tx.tipo)
-        })
+            "tipo": tipo_str
+        }
+        if include_audit:
+            rec["id"] = getattr(tx, "id", None)
+            rec["pagina"] = getattr(tx, "pagina", 1)
+            rec["saldo_renglon"] = getattr(tx, "saldo_renglon", None)
+            rec["confianza"] = getattr(tx, "confianza", 1.0)
+            rec["origen"] = getattr(tx, "origen", "llm")
+            rec["estado_revision"] = getattr(tx, "estado_revision", "pendiente")
+            rec["linea_origen"] = getattr(tx, "linea_origen", "")
+        records.append(rec)
 
     df = pd.DataFrame(records)
+    # Order columns consistently
+    if include_audit:
+        ordered_cols = [c for c in AUDIT_COLUMNS if c in df.columns]
+        df = df[ordered_cols]
     # Sort by fecha descending/ascending if valid dates
     try:
         df["_sort_date"] = pd.to_datetime(df["fecha"], errors="coerce")
@@ -48,16 +76,22 @@ def create_standard_dataframe(transactions: list) -> pd.DataFrame:
     return df
 
 
+def create_audit_dataframe(transactions: list) -> pd.DataFrame:
+    """Convenience helper to build a full audit DataFrame with trace columns."""
+    return create_standard_dataframe(transactions, include_audit=True)
+
+
 def df_to_excel_bytes(df_ingresos: pd.DataFrame, df_egresos: pd.DataFrame) -> bytes:
     """
     Generates an in-memory .xlsx file with two distinct sheets:
-    'Ingresos' and 'Egresos', properly formatted with openpyxl.
+    'Ingresos' and 'Egresos', properly formatted with openpyxl,
+    excluding internal audit columns.
     """
     output = io.BytesIO()
     
-    # Drop 'tipo' column if present before writing to individual sheets
-    clean_ingresos = df_ingresos.drop(columns=["tipo"], errors="ignore")
-    clean_egresos = df_egresos.drop(columns=["tipo"], errors="ignore")
+    # Drop audit and 'tipo' columns before writing to individual sheets
+    clean_ingresos = df_ingresos.drop(columns=AUDIT_COLS_TO_DROP, errors="ignore")
+    clean_egresos = df_egresos.drop(columns=AUDIT_COLS_TO_DROP, errors="ignore")
 
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
         clean_ingresos.to_excel(writer, sheet_name="Ingresos", index=False)
@@ -68,19 +102,19 @@ def df_to_excel_bytes(df_ingresos: pd.DataFrame, df_egresos: pd.DataFrame) -> by
 
 def df_to_tsv(df: pd.DataFrame) -> str:
     """
-    Converts DataFrame to a Tab-Separated Values string without row index.
-    This is the exact format Excel reads when pasting with Ctrl+V.
+    Converts DataFrame to a Tab-Separated Values string without row index,
+    excluding internal audit columns.
     """
-    clean_df = df.drop(columns=["tipo"], errors="ignore")
+    clean_df = df.drop(columns=AUDIT_COLS_TO_DROP, errors="ignore")
     return clean_df.to_csv(sep="\t", index=False)
 
 
 def df_to_csv_bytes(df: pd.DataFrame) -> bytes:
     """
     Converts DataFrame to CSV bytes with UTF-8 BOM so Excel on Windows
-    renders Spanish accents (tildes, ñ) correctly.
+    renders Spanish accents correctly, excluding internal audit columns.
     """
-    clean_df = df.drop(columns=["tipo"], errors="ignore")
+    clean_df = df.drop(columns=AUDIT_COLS_TO_DROP, errors="ignore")
     return clean_df.to_csv(index=False, encoding="utf-8-sig").encode("utf-8-sig")
 
 
@@ -199,13 +233,23 @@ def reconcile_transactions(
     s_ini = round(float(saldo_inicial), 2)
     s_fin = round(float(saldo_final), 2)
 
+    sum_data = dict(summary_data) if summary_data else {}
+    if "saldo_inicial" not in sum_data and s_ini is not None:
+        sum_data["saldo_inicial"] = s_ini
+    if "saldo_final" not in sum_data and s_fin is not None:
+        sum_data["saldo_final"] = s_fin
+    if "total_cargos" not in sum_data:
+        sum_data["total_cargos"] = total_egresos
+    if "total_abonos" not in sum_data:
+        sum_data["total_abonos"] = total_ingresos
+
     # Resolve modo_contable deterministically without guessing or picking min(diff)
     effective_mode = modo_contable
     if not effective_mode:
         comb_text = text or ""
         if not comb_text and transactions:
             comb_text = " ".join(f"{tx.concepto} {tx.descripcion}" for tx in transactions)
-        effective_mode = infer_statement_mode(comb_text, summary_data or {})
+        effective_mode = infer_statement_mode(comb_text, sum_data)
 
     # Evaluate running balance chain if saldo_renglon is available on transaction rows
     filas_con_saldo = 0

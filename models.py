@@ -35,12 +35,27 @@ def normalizar_tipo_transaccion(tipo: str) -> str:
     if not tipo or not isinstance(tipo, str):
         return "EGRESO"
     clean = tipo.strip().lower()
+
+    # 1. Términos explícitos de salida / egreso (deben prevalecer sobre 'pag')
+    terminos_egreso = (
+        "pago de servicio", "pago servicio", "pago tarjeta", "pago de tarjeta",
+        "pago a", "cargo", "compra", "retiro", "comision", "spei enviado",
+        "egreso", "cgo", "disposicion", "iva"
+    )
+    if any(term in clean for term in terminos_egreso):
+        return "EGRESO"
+
+    # 2. Términos explícitos de ingreso / abono
     if clean in ("abono", "ingreso", "deposito", "pago", "spei recibido", "reembolso", "devolucion", "bonificacion"):
         return "INGRESO"
-    if clean in ("cargo", "egreso", "retiro", "compra", "cgo", "disposicion", "comision", "iva", "spei enviado"):
-        return "EGRESO"
-    if "ingres" in clean or "abon" in clean or "deposit" in clean or "pag" in clean:
+
+    terminos_ingreso_estrictos = ("su pago", "pago recibido", "abono", "deposito", "ingreso", "spei recibido")
+    if any(term in clean for term in terminos_ingreso_estrictos):
         return "INGRESO"
+
+    if "ingres" in clean or "abon" in clean or "deposit" in clean:
+        return "INGRESO"
+
     return "EGRESO"
 
 
@@ -177,6 +192,10 @@ class Transaccion(BaseModel):
         default=1,
         description="Número de página del documento donde se ubica la transacción"
     )
+    id: Optional[int] = Field(
+        default=None,
+        description="Identificador único en base de datos si la transacción ha sido persistida"
+    )
 
     @field_validator("importe", mode="before")
     @classmethod
@@ -196,6 +215,7 @@ class TransaccionPlana(BaseModel):
     Matches the Ollama 'format' specification.
     """
     fecha: str = Field(..., description="Fecha de la transacción (YYYY-MM-DD o variante textual)")
+    concepto: str = Field(default="", description="Nombre corto del comercio o concepto")
     descripcion: str = Field(..., description="Descripción detallada o concepto del movimiento")
     importe: float = Field(..., description="Monto monetario de la transacción")
     tipo: str = Field(..., description="Tipo de movimiento: cargo, abono, egreso, ingreso, compra, pago, etc.")
@@ -203,6 +223,17 @@ class TransaccionPlana(BaseModel):
     saldo_renglon: Optional[float] = Field(default=None, description="Saldo posterior al movimiento si aparece en el renglón")
     linea_origen: str = Field(default="", description="Línea o texto crudo original del documento")
     pagina: int = Field(default=1, description="Número de página del documento donde se ubica la transacción")
+
+
+class VLMBalancesSchema(BaseModel):
+    """
+    Flat Pydantic schema for extracting summary balances via VLM.
+    """
+    saldo_inicial: Optional[float] = Field(default=None, description="Saldo inicial o saldo anterior reportado")
+    saldo_final: Optional[float] = Field(default=None, description="Saldo final, nuevo saldo o saldo al corte")
+    total_cargos: Optional[float] = Field(default=None, description="Monto total acumulado de cargos o egresos")
+    total_abonos: Optional[float] = Field(default=None, description="Monto total acumulado de abonos o ingresos")
+    modo_sugerido: str = Field(default="debito", description="Modo contable inferido del cuadro: debito o credito")
 
 
 class LLMTransaccionesList(BaseModel):
@@ -470,6 +501,8 @@ def compute_row_confidence(
         base = 0.85
     elif "tabla" in origen:
         base = 0.85
+    elif "vlm_qwen3" in origen or "vlm" in origen:
+        base = 0.80
     elif "heurist" in origen:
         base = 0.45
     elif "llm" in origen:

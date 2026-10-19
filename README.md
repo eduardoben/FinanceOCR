@@ -67,7 +67,7 @@ flowchart TD
 
 ### 1. Privacidad Total y Procesamiento 100% Local
 - Todos los documentos bancarios, comprobantes fiscales y datos financieros se procesan y almacenan exclusivamente en la maquina local.
-- Conexion directa mediante HTTP REST con el servidor local de Ollama (http://localhost:11434) empleando modelos abiertos como gemma4:12b, qwen2.5, llama3.1 o deepseek-r1.
+- Conexion directa mediante HTTP REST con el servidor local de Ollama (http://localhost:11434) empleando el modelo multimodal predeterminado `qwen3-vl:4b` u otros modelos abiertos como `gemma4:12b`, `qwen2.5`, `llama3.1` o `deepseek-r1`.
 - Cero telemetria externa, cero rastreadores y cero transmision de credenciales o estados financieros a nubes externas.
 
 ### 2. Estrategias de Extraccion Flexibles (Globales y por Archivo)
@@ -157,11 +157,13 @@ El modulo reconcile_transactions verifica la integridad matematica de la extracc
   - Descarga CSV: Codificacion UTF-8 con BOM (utf-8-sig) para compatibilidad nativa con acentos y caracteres especiales en Windows.
 - Auditoria y Purga: Panel para listar todos los estados de cuenta, inspeccionar sus paginas y eliminarlos en cascada (base de datos y archivo fisico en disco).
 
-### 10. Verificación Dirigida por Página y Multipass (Fase 4)
+### 10. Verificación Dirigida Híbrida por Página y Visión Multimodal VLM (Fase 4 & VLM)
 - **Detección Automática de Páginas Dudosas (`identify_low_confidence_pages`):** Identifica y aisla exclusivamente las páginas que contienen filas con `confianza < 0.75`, `estado_revision == "REVISAR"`, rupturas en la cadena secuencial de saldo (`saldo_prev +- importe != saldo_renglon`), filas rechazadas o cobertura de página `< 0.99`.
-- **Segunda Pasada de Alta Resolución (`reextract_pages_high_res`):** Ejecuta una instancia secundaria cacheada de Docling con `TableFormerMode.ACCURATE`, `images_scale=3.0` y OCR de página completa forzado exclusivamente sobre las páginas dudosas, reduciendo drásticamente el costo de cómputo en comparación con reprocesar el documento completo.
+- **Segunda Pasada de Alta Resolución (`reextract_pages_high_res`):** Ejecuta una instancia secundaria cacheada de Docling con `TableFormerMode.ACCURATE`, `images_scale=3.0` y OCR de página completa forzado exclusivamente sobre las páginas dudosas.
+- **Extracción Visual Multimodal de Respaldo (`reextract_pages_vlm` con `qwen3-vl:4b`):** Si la re-extracción con Docling ACCURATE no logra cuadrar la cadena de saldo (`cadena_ok == False`), el sistema renderiza la página a 2.5x e invoca directamente el modelo multimodal local `qwen3-vl:4b` vía Ollama (`/api/chat` con imágenes Base64 y JSON estructurado), asignando `origen = "vlm_qwen3"` y confianza base de 0.80.
+- **Extracción Visual Automática de Saldos (`extract_balances_vlm`):** Cuando la extracción determinista por expresiones regulares no encuentra `saldo_inicial` o `saldo_final` en el texto del estado de cuenta, renderiza la primera página y utiliza `qwen3-vl:4b` con el esquema `VLMBalancesSchema` para leer visualmente el cuadro de resumen financiero.
 - **Arbitraje y Reconciliación Multipasada (`reconcile_extraction_passes`):**
-  - Si la pasada 2 logra cuadrar la cadena de saldo con tolerancia `<= 0.01`, promueve automáticamente las filas a `VERIFICADO`, actualiza `origen = "verificado_multipass"` y recalcula la confianza a `1.0`.
+  - Si una pasada posterior logra cuadrar la cadena de saldo con tolerancia `<= 0.01`, promueve automáticamente las filas a `VERIFICADO`, actualiza `origen = "verificado_multipass"` y recalcula la confianza a `1.0`.
   - Si ambas pasadas difieren y ninguna cuadra la cadena, marca las filas con `DISCREPANCIA_OCR`, reduce la confianza a `<= 0.40` y almacena las anotaciones de auditoría.
 - **Trazabilidad de Páginas:** Cada transacción conserva su número de página de origen (`pagina: int`) en memoria, base de datos y exportaciones.
 
@@ -355,8 +357,10 @@ El proyecto cuenta con 78 pruebas unitarias y de integracion totalmente automati
    - Puntuación de confianza por fila (`compute_row_confidence`) y matriz de penalizaciones.
    - Integridad estructural de exportaciones a Excel (ZIP PK), CSV con BOM y TSV sin columnas internas.
    - Certeza y cálculo de `ReconciliacionResultado`.
+   - Priorización estricta de egresos en `normalizar_tipo_transaccion` (pagos de servicios/tarjetas) y restricción de ingresos a abonos explícitos.
+   - Preservación exhaustiva de campos de auditoría (`saldo_renglon`, `linea_origen`, `pagina`, `concepto`) en `_process_candidate_tx_dict`.
 
-2. `test_database.py` (19 tests):
+2. `test_database.py` (20 tests):
    - Inicialización idempotente del esquema y de los 9 índices B-Tree (incluyendo `pagina` y `filas_rechazadas`).
    - Cálculo determinista del hash SHA-256.
    - Detección de duplicados y recuperación de metadatos de archivos.
@@ -371,10 +375,11 @@ El proyecto cuenta con 78 pruebas unitarias y de integracion totalmente automati
    - Ciclo de vida completo de puntos de control de lote (`save_batch_checkpoint`, `get_batch_checkpoint`, `clear_batch_checkpoint`).
    - Interrupción, registro de archivo fallido y recuperación progresiva del lote.
    - Migración segura no destructiva `ALTER TABLE` para bases heredadas.
-   - Persistencia, consulta y eliminación en cascada de `filas_rechazadas`.
+   - Persistencia, consulta y eliminación en cascada de `filas_rechazadas` con columna `pagina`.
    - Preservación y migración de la columna `pagina` en transacciones.
+   - Edición manual y sincronización atómica de conciliación en SQLite con `update_transaction_review`.
 
-3. `test_ocr_optimization.py` (11 tests):
+3. `test_ocr_optimization.py` (13 tests):
    - Detección heurística de perfil PDF (menor a 10ms) diferenciando capas vectoriales de escaneos rasterizados.
    - Renderizado visual de páginas PDF a imagen PIL para el visor interactivo.
    - Reutilización de convertidores singleton en caché de memoria (`_CONVERTERS_CACHE`).
@@ -386,6 +391,8 @@ El proyecto cuenta con 78 pruebas unitarias y de integracion totalmente automati
    - Parser determinista de tablas Markdown (`parse_docling_markdown_tables`), fusión multilínea y detección de celdas invertidas/desplazadas.
    - Selección dirigida de páginas dudosas (`identify_low_confidence_pages`): aislamiento de páginas con rupturas de saldo o baja confianza.
    - Arbitraje y reconciliación de pasadas (`reconcile_extraction_passes`): promoción a `VERIFICADO` con `origen="verificado_multipass"` o degradación a `DISCREPANCIA_OCR`.
+   - Extracción visual VLM de páginas dudosas con `qwen3-vl:4b` (`extract_page_transactions_vlm`) con validación de imágenes Base64 y asignación de `origen="vlm_qwen3"`.
+   - Extracción visual automática de saldos de resumen con `qwen3-vl:4b` (`extract_balances_vlm`) y esquema `VLMBalancesSchema`.
 
 4. `test_telemetry.py` (4 tests):
    - Estructura y tipos de datos del monitor de telemetría de hardware (CPU, RAM, GPU).
@@ -422,7 +429,7 @@ El proyecto cuenta con 78 pruebas unitarias y de integracion totalmente automati
 
 ### Ejecucion de Pruebas
 
-Para ejecutar la suite completa de 78 pruebas con `pytest` en PowerShell:
+Para ejecutar la suite completa de 83 pruebas con `pytest` en PowerShell:
 
 ```powershell
 .\.venv\Scripts\pytest.exe test_data_validation.py test_database.py test_ocr_optimization.py test_telemetry.py test_system.py -v
@@ -452,11 +459,11 @@ Para ejecutar suites individuales o compuertas específicas:
 2. Servidor Local Ollama:
    - Descarga gratuita e instalacion desde https://ollama.com.
    - Inicia la aplicacion o servicio de Ollama (por defecto en http://localhost:11434).
-   - Descarga el modelo recomendado para extraccion estructurada:
+   - Descarga el modelo multimodal predeterminado del sistema:
      ```bash
-     ollama pull gemma4:12b
+     ollama pull qwen3-vl:4b
      ```
-   - Modelos alternativos soportados: qwen2.5:14b, llama3.1:8b, deepseek-r1:14b.
+   - Modelos alternativos compatibles para extracción: `gemma4:12b`, `qwen2.5:14b`, `llama3.1:8b`, `deepseek-r1:14b`.
 3. GPU NVIDIA Opcional: Si se cuenta con tarjeta NVIDIA y controladores actualizados, el monitor detectara automaticamente el uso de VRAM y temperatura mediante nvidia-smi.
 
 ---
