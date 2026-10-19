@@ -20,8 +20,15 @@ import unittest
 import pandas as pd
 from pydantic import ValidationError
 
-from models import Transaccion, TipoTransaccion, TransaccionesResponse
-from date_utils import normalize_spanish_date
+from models import (
+    Transaccion,
+    TipoTransaccion,
+    TransaccionesResponse,
+    ReconciliacionResultado,
+    sanitize_importe,
+    validar_reconciliacion,
+)
+from date_utils import normalize_spanish_date, resolve_year_for_month, extract_statement_period
 from database import (
     db_session,
     init_db,
@@ -332,6 +339,140 @@ class TestDataValidationAndIntegrity(unittest.TestCase):
         self.assertEqual(lines[0].split("\t"), ["fecha", "concepto", "importe", "descripción"])
         self.assertIn("Honorarios SAT\t12500.5\tFactura F-101", lines[1])
 
+    # -------------------------------------------------------------
+    # 6. ETAPA 1: ACCOUNTING AMOUNT SANITIZATION & RECONCILIATION
+    # -------------------------------------------------------------
+    def test_accounting_amount_sanitization_parentheses_and_suffixes(self):
+        """
+        Verifies that sanitize_importe properly processes accounting formats:
+        - Parentheses: (1,234.56), ($1,234.56)
+        - Suffix minus: 1,234.56-, $1,234.56-
+        - Preserves negative sign when keep_sign=True for Cargo/Abono validation
+        - Yields absolute float when keep_sign=False or used in Transaccion.importe
+        """
+        accounting_cases = [
+            ("(1,234.56)", -1234.56, 1234.56),
+            ("1,234.56-", -1234.56, 1234.56),
+            ("($1,234.56)", -1234.56, 1234.56),
+            ("$1,234.56-", -1234.56, 1234.56),
+            (" (1,234.56 MXN) ", -1234.56, 1234.56),
+            ("-$500.00", -500.00, 500.00),
+            ("$ 2,500.00 USD", 2500.00, 2500.00),
+        ]
+
+        for raw_val, expected_signed, expected_abs in accounting_cases:
+            # Standalone function with sign preservation
+            val_signed = sanitize_importe(raw_val, keep_sign=True)
+            self.assertAlmostEqual(
+                val_signed,
+                expected_signed,
+                places=2,
+                msg=f"Failed keep_sign=True for: {raw_val}"
+            )
+
+            # Standalone function with absolute value
+            val_abs = sanitize_importe(raw_val, keep_sign=False)
+            self.assertAlmostEqual(
+                val_abs,
+                expected_abs,
+                places=2,
+                msg=f"Failed keep_sign=False for: {raw_val}"
+            )
+
+            # Pydantic Transaccion model must store absolute positive float
+            tx = Transaccion(
+                fecha="2024-03-01",
+                concepto="Accounting Test",
+                importe=raw_val,
+                descripcion="Prueba contable",
+                tipo=TipoTransaccion.EGRESO
+            )
+            self.assertAlmostEqual(
+                tx.importe,
+                expected_abs,
+                places=2,
+                msg=f"Transaccion.importe should be positive absolute float for: {raw_val}"
+            )
+
+    def test_reconciliacion_resultado_certainty_and_calculation(self):
+        """
+        Verifies ReconciliacionResultado attributes and mathematical validation:
+        saldo_final_calculado = round(saldo_inicial + total_abonos - total_cargos, 2)
+        diferencia = round(abs(saldo_final_esperado - saldo_final_calculado), 2)
+        cuadra = diferencia <= 0.01
+        """
+        # Exact match
+        res_exact = ReconciliacionResultado.validar(
+            saldo_inicial=1000.0,
+            total_abonos=500.0,
+            total_cargos=200.0,
+            saldo_final_esperado=1300.0
+        )
+        self.assertEqual(res_exact.saldo_inicial, 1000.0)
+        self.assertEqual(res_exact.total_abonos, 500.0)
+        self.assertEqual(res_exact.total_cargos, 200.0)
+        self.assertEqual(res_exact.saldo_final_esperado, 1300.0)
+        self.assertEqual(res_exact.saldo_final_calculado, 1300.0)
+        self.assertEqual(res_exact.diferencia, 0.0)
+        self.assertTrue(res_exact.cuadra)
+        # Backward compatibility checks
+        self.assertTrue(res_exact.conciliado)
+        self.assertEqual(res_exact.total_ingresos, 500.0)
+        self.assertEqual(res_exact.total_egresos, 200.0)
+
+        # Tolerated rounding difference <= 0.01
+        res_tol = ReconciliacionResultado.validar(
+            saldo_inicial=1000.0,
+            total_abonos=500.0,
+            total_cargos=200.0,
+            saldo_final_esperado=1300.01
+        )
+        self.assertEqual(res_tol.diferencia, 0.01)
+        self.assertTrue(res_tol.cuadra)
+
+        # Discrepancy > 0.01
+        res_disc = ReconciliacionResultado.validar(
+            saldo_inicial=1000.0,
+            total_abonos=500.0,
+            total_cargos=200.0,
+            saldo_final_esperado=1295.50
+        )
+        self.assertEqual(res_disc.diferencia, 4.50)
+        self.assertFalse(res_disc.cuadra)
+        self.assertFalse(res_disc.conciliado)
+
+        # Convenience helper
+        res_helper = validar_reconciliacion(
+            saldo_inicial=2500.0,
+            total_abonos=1000.0,
+            total_cargos=500.0,
+            saldo_final_esperado=3000.0
+        )
+        self.assertEqual(res_helper.saldo_final_calculado, 3000.0)
+        self.assertTrue(res_helper.cuadra)
+
+    def test_spanish_dates_without_year_and_period_transition(self):
+        """
+        Verifies Spanish banking dates without explicit year (e.g. 15/ENE, 03-FEB, 12 MAR)
+        infer year from period and properly handle December-to-January transitions.
+        """
+        # Inference with default_year
+        self.assertEqual(normalize_spanish_date("15/ENE", default_year=2024), "2024-01-15")
+        self.assertEqual(normalize_spanish_date("03-FEB", default_year=2024), "2024-02-03")
+        self.assertEqual(normalize_spanish_date("12 MAR", default_year=2024), "2024-03-12")
+        self.assertEqual(normalize_spanish_date("15/01", default_year=2024), "2024-01-15")
+
+        # Cross-year statement period: 16 Dic 25 - 15 Ene 26
+        period_str = "16 Dic 25 - 15 Ene 26"
+        self.assertEqual(normalize_spanish_date("20/DIC", statement_period=period_str), "2025-12-20")
+        self.assertEqual(normalize_spanish_date("05/ENE", statement_period=period_str), "2026-01-05")
+
+        # Cross-year statement period with tuple of ISO dates
+        period_tuple = ("2023-12-01", "2024-01-31")
+        self.assertEqual(normalize_spanish_date("31/DIC", statement_period=period_tuple), "2023-12-31")
+        self.assertEqual(normalize_spanish_date("02/ENE", statement_period=period_tuple), "2024-01-02")
+
 
 if __name__ == "__main__":
     unittest.main()
+

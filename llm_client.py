@@ -278,11 +278,113 @@ def clean_and_parse_llm_json(raw_content: str, thinking_content: str = "") -> Li
     return salvaged_txs
 
 
+def clean_description(desc: str) -> str:
+    """Normalizes description by trimming whitespace and lowercasing."""
+    if not desc:
+        return ""
+    return " ".join(desc.strip().lower().split())
+
+
+def extract_explicit_bank_reference(text: str) -> Optional[str]:
+    """
+    Extracts an explicit bank reference, tracking code, or authorization folio if present.
+    Examples:
+    - 'REF: 12345678' -> '12345678'
+    - 'FOLIO: ABC-99' -> 'abc-99'
+    - 'AUT: 554433'   -> '554433'
+    - 'SPEI: 014028'  -> '014028'
+    """
+    if not text:
+        return None
+    match = re.search(
+        r"\b(?:ref(?:erencia)?|folio|aut(?:orizacion)?|spei|rastreo)[^\w\d]{0,5}([a-z0-9\-]{4,40})\b",
+        text,
+        re.IGNORECASE
+    )
+    if match:
+        return match.group(1).lower()
+    return None
+
+
+def deduplicate_within_chunk(transactions: List[Transaccion]) -> List[Transaccion]:
+    """
+    Conserves identical transactions within the same chunk (e.g. repeated purchases at the same store on the same day)
+    UNLESS they possess the exact same explicit bank reference/folio.
+    """
+    seen_refs = set()
+    result = []
+    for tx in transactions:
+        ref = extract_explicit_bank_reference(tx.descripcion)
+        if ref:
+            ref_key = (tx.fecha, round(float(tx.importe), 2), ref)
+            if ref_key in seen_refs:
+                continue
+            seen_refs.add(ref_key)
+        result.append(tx)
+    return result
+
+
+def deduplicate_adjacent_chunks(
+    chunk_i_txs: List[Transaccion],
+    chunk_next_txs: List[Transaccion],
+    boundary_window: int = 5
+) -> List[Transaccion]:
+    """
+    Deduplicates transactions between adjacent chunks (chunk_i, chunk_i+1):
+    - Compares only the last `boundary_window` movements of chunk_i against the first `boundary_window` of chunk_i+1
+      using the tuple: (fecha, round(importe, 2), descripcion_limpia).
+    - Preserves legitimate twin transactions within the chunks unless they share an explicit identical bank reference.
+
+    Returns:
+        List[Transaccion]: The filtered transactions from chunk_next_txs that were not repeated from chunk_i boundary.
+    """
+    if not chunk_i_txs or not chunk_next_txs:
+        return deduplicate_within_chunk(chunk_next_txs)
+
+    # Clean the tail of chunk_i
+    tail = chunk_i_txs[-boundary_window:]
+    tail_keys = {
+        (tx.fecha, round(float(tx.importe), 2), clean_description(tx.descripcion))
+        for tx in tail
+    }
+
+    # Filter out boundary duplicates from the head of chunk_next_txs
+    filtered_next: List[Transaccion] = []
+    for idx, tx in enumerate(chunk_next_txs):
+        key = (tx.fecha, round(float(tx.importe), 2), clean_description(tx.descripcion))
+        if idx < boundary_window and key in tail_keys:
+            # Overlapping boundary duplicate row from previous table chunk
+            continue
+        filtered_next.append(tx)
+
+    # Within the remaining chunk_next_txs, deduplicate only identical bank references
+    return deduplicate_within_chunk(filtered_next)
+
+
+def deduplicate_all_chunks(
+    chunks_transactions: List[List[Transaccion]],
+    boundary_window: int = 5
+) -> List[Transaccion]:
+    """
+    Processes a sequence of chunk transaction lists, applying intra-chunk preservation
+    and adjacent-boundary deduplication across chunk_i and chunk_i+1.
+    """
+    if not chunks_transactions:
+        return []
+
+    accumulated: List[Transaccion] = deduplicate_within_chunk(chunks_transactions[0])
+    for next_chunk in chunks_transactions[1:]:
+        deduped_next = deduplicate_adjacent_chunks(accumulated, next_chunk, boundary_window=boundary_window)
+        accumulated.extend(deduped_next)
+
+    return accumulated
+
+
 def extract_transactions_with_ollama(
     text_content: str,
     base_url: str = "http://localhost:11434",
     model: str = "gemma4:12b",
-    num_ctx: int = 16384,
+    num_ctx: int = 8192,
     timeout_seconds: float = 180.0
 ) -> List[Transaccion]:
     """
@@ -338,19 +440,23 @@ def extract_transactions_with_ollama(
                     }
                 ],
                 "stream": False,
+                "format": "json",
                 "options": {
-                    "temperature": 0.7,
-                    "num_ctx": num_ctx,
+                    "temperature": 0.0,
+                    "num_ctx": 8192,
                     "num_predict": 8192
                 }
             }
 
-            max_retries = 3
+            max_retries = 2
             attempt = 0
             success = False
             last_err = None
+            chunk_txs: List[Transaccion] = []
+            raw_message_content = ""
+            thinking_content = ""
 
-            while attempt < max_retries and not success:
+            while attempt <= max_retries and not success:
                 attempt += 1
                 try:
                     response = client.post(f"{clean_url}/api/chat", json=payload)
@@ -360,43 +466,41 @@ def extract_transactions_with_ollama(
                     raw_message_content = msg.get("content", "")
                     thinking_content = msg.get("thinking", "")
 
-                    # Parse and validate with fault-tolerant cleaner
-                    chunk_txs = clean_and_parse_llm_json(raw_message_content, thinking_content)
-                    print(f"[Ollama] Fragmento {chunk_idx + 1}/{len(candidate_chunks)}: {len(chunk_txs)} transacciones extraídas.")
-
-                    current_chunk_keys = set()
-                    for tx in chunk_txs:
-                        # Normalize date with statement year fallback
-                        tx.fecha = normalize_spanish_date(tx.fecha, default_year=statement_year)
-                        if tx.importe <= 0.001:
+                    # Strict JSON parsing first
+                    try:
+                        chunk_txs = parse_strict_llm_json(raw_message_content)
+                        if chunk_txs or not raw_message_content.strip():
+                            success = True
+                        else:
+                            raise ValueError("Strict JSON parsing returned empty transaction list")
+                    except Exception as json_err:
+                        last_err = json_err
+                        if attempt <= max_retries:
+                            print(f"[Ollama] Error al parsear JSON en fragmento {chunk_idx + 1} (intento {attempt}/{max_retries + 1}). Reintentando...")
+                            time.sleep(1.0)
                             continue
-                        desc_clean = tx.descripcion.strip().lower() if tx.descripcion else ""
-                        key = (tx.fecha, tx.concepto.strip().lower(), round(tx.importe, 2), tx.tipo, desc_clean)
-
-                        # Adjacent chunk deduplication: filters out rows split/repeated across chunk boundaries,
-                        # while preserving legitimate same-day twin transactions within the current chunk
-                        if key in prev_chunk_keys:
-                            continue
-                        current_chunk_keys.add(key)
-                        all_transactions.append(tx)
-
-                    prev_chunk_keys = current_chunk_keys
-                    success = True
+                        else:
+                            # Invoke heuristic fallback after max retries
+                            print(f"[Ollama] Invocando fallback heurístico en fragmento {chunk_idx + 1} tras agotar reintentos de parseo...")
+                            chunk_txs = parse_heuristic_fallback(raw_message_content, thinking_content)
+                            success = True
 
                 except (httpx.ConnectError, httpx.TimeoutException) as conn_err:
                     last_err = conn_err
-                    if attempt < max_retries:
+                    if attempt <= max_retries:
                         backoff = 1.5 * attempt
-                        print(f"[Ollama] Conexión/Timeout en fragmento {chunk_idx + 1}. Reintento {attempt}/{max_retries} en {backoff}s...")
+                        print(f"[Ollama] Timeout o error de conexión en fragmento {chunk_idx + 1} (intento {attempt}/{max_retries + 1}). Reintentando en {backoff}s...")
                         time.sleep(backoff)
                     else:
                         print(f"[Ollama] Falló conexión tras {max_retries} reintentos en fragmento {chunk_idx + 1}: {conn_err}")
+                        raise RuntimeError(
+                            f"Timeout/Error de conexión en Ollama en fragmento {chunk_idx + 1} tras {max_retries} reintentos: {conn_err}"
+                        ) from conn_err
                 except httpx.HTTPStatusError as e:
                     last_err = e
-                    # Retry on 5xx or rate limit 429
-                    if e.response.status_code in (429, 500, 502, 503, 504) and attempt < max_retries:
+                    if e.response.status_code in (429, 500, 502, 503, 504) and attempt <= max_retries:
                         backoff = 2.0 * attempt
-                        print(f"[Ollama] Error HTTP {e.response.status_code} en fragmento {chunk_idx + 1}. Reintento {attempt}/{max_retries} en {backoff}s...")
+                        print(f"[Ollama] Error HTTP {e.response.status_code} en fragmento {chunk_idx + 1}. Reintento {attempt}/{max_retries + 1} en {backoff}s...")
                         time.sleep(backoff)
                     else:
                         raise RuntimeError(
@@ -404,17 +508,22 @@ def extract_transactions_with_ollama(
                         ) from e
                 except Exception as e:
                     last_err = e
-                    print(f"[Advertencia] Fragmento {chunk_idx + 1}/{len(candidate_chunks)} error de análisis: {str(e)}")
-                    if attempt < max_retries:
-                        backoff = 1.5 * attempt
-                        time.sleep(backoff)
+                    if attempt <= max_retries:
+                        time.sleep(1.0)
                     else:
-                        raise RuntimeError(f"Error en fragmento {chunk_idx + 1} de {len(candidate_chunks)}: {str(e)}") from e
+                        chunk_txs = parse_heuristic_fallback(raw_message_content, thinking_content)
+                        success = True
 
             if not success:
-                raise RuntimeError(
-                    f"Error de extracción en Ollama en fragmento {chunk_idx + 1} tras {max_retries} intentos: {str(last_err)}"
-                ) from last_err
+                chunk_txs = parse_heuristic_fallback(raw_message_content, thinking_content)
+
+            # Normalize date with statement year fallback
+            for tx in chunk_txs:
+                tx.fecha = normalize_spanish_date(tx.fecha, default_year=statement_year)
+
+            valid_chunk_txs = [tx for tx in chunk_txs if tx.importe > 0.001]
+            deduped = deduplicate_adjacent_chunks(all_transactions, valid_chunk_txs, boundary_window=5)
+            all_transactions.extend(deduped)
 
     print(f"[Ollama] Extracción finalizada: {len(all_transactions)} transacciones identificadas.")
     return all_transactions

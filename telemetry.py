@@ -18,16 +18,27 @@ def get_system_metrics() -> Dict[str, Any]:
     Fast execution (<50ms), fully local, no external network calls.
     """
     # 1. CPU Metrics
-    cpu_percent = psutil.cpu_percent(interval=None)
-    cpu_cores_logical = psutil.cpu_count(logical=True) or 1
-    cpu_cores_physical = psutil.cpu_count(logical=False) or 1
+    try:
+        cpu_percent = psutil.cpu_percent(interval=None)
+        cpu_cores_logical = psutil.cpu_count(logical=True) or 1
+        cpu_cores_physical = psutil.cpu_count(logical=False) or 1
+    except Exception:
+        cpu_percent = 0.0
+        cpu_cores_logical = 1
+        cpu_cores_physical = 1
 
     # 2. RAM Metrics
-    vmem = psutil.virtual_memory()
-    ram_total_gb = round(vmem.total / (1024 ** 3), 2)
-    ram_used_gb = round(vmem.used / (1024 ** 3), 2)
-    ram_available_gb = round(vmem.available / (1024 ** 3), 2)
-    ram_percent = vmem.percent
+    try:
+        vmem = psutil.virtual_memory()
+        ram_total_gb = round(vmem.total / (1024 ** 3), 2)
+        ram_used_gb = round(vmem.used / (1024 ** 3), 2)
+        ram_available_gb = round(vmem.available / (1024 ** 3), 2)
+        ram_percent = vmem.percent
+    except Exception:
+        ram_total_gb = 0.0
+        ram_used_gb = 0.0
+        ram_available_gb = 0.0
+        ram_percent = 0.0
 
     # 3. GPU Metrics (NVIDIA via nvidia-smi)
     gpu_info: Dict[str, Any] = {

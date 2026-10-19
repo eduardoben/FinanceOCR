@@ -12,6 +12,7 @@ import sys
 import tempfile
 import multiprocessing
 from datetime import datetime
+from typing import Optional, List, Dict, Any, Tuple
 import pandas as pd
 import streamlit as st
 
@@ -24,6 +25,7 @@ from parsers import (
     resolve_pdf_strategy,
     resolve_xml_strategy,
     extract_statement_balances,
+    get_cached_converter,
 )
 from llm_client import check_ollama_connection, extract_transactions_with_ollama
 from telemetry import render_telemetry_expander, StageStopwatch
@@ -35,20 +37,8 @@ from utils import (
     render_clipboard_button,
     reconcile_transactions,
 )
-
-
-@st.cache_data(show_spinner=False)
-def cached_detect_pdf_profile(file_bytes: bytes) -> dict:
-    """Cached wrapper around detect_pdf_profile for snappy UI interactions."""
-    return detect_pdf_profile(file_bytes)
-
-
-@st.cache_data(show_spinner=False)
-def cached_render_pdf_page_image(file_bytes: bytes, page_number: int, scale: float = 1.0):
-    """Cached wrapper around render_pdf_page_image for instantaneous page previewing."""
-    return render_pdf_page_image(file_bytes, page_number=page_number, scale=scale)
-
 from database import (
+    hash_sha256,
     compute_file_hash,
     check_file_processed,
     save_processed_transactions,
@@ -66,13 +56,53 @@ from database import (
     clear_batch_checkpoint,
 )
 
-# Page configuration
+# Page configuration - Must be the very first Streamlit command
 st.set_page_config(
     page_title="Extractor Financiero Local | PDF & XML",
     page_icon="🏦",
     layout="wide",
     initial_sidebar_state="expanded",
 )
+
+
+@st.cache_data(show_spinner=False)
+def cached_detect_pdf_profile(file_bytes: bytes) -> dict:
+    """Cached wrapper around detect_pdf_profile for snappy UI interactions."""
+    return detect_pdf_profile(file_bytes)
+
+
+@st.cache_data(show_spinner=False)
+def cached_render_pdf_page_image(file_bytes: bytes, page_number: int, scale: float = 1.0):
+    """Cached wrapper around render_pdf_page_image for instantaneous page previewing."""
+    return render_pdf_page_image(file_bytes, page_number=page_number, scale=scale)
+
+
+@st.cache_resource(show_spinner=False)
+def get_cached_ocr_engine(
+    enable_ocr: bool = False,
+    accurate_tables: bool = False,
+    num_threads: Optional[int] = None,
+    ocr_scale: float = 2.0,
+):
+    """
+    Inicializa y almacena en caché el motor OCR singleton (Docling DocumentConverter)
+    evitando recargas de pesos del pipeline en cada interacción y optimizando memoria.
+    """
+    return get_cached_converter(
+        enable_ocr=enable_ocr,
+        accurate_tables=accurate_tables,
+        num_threads=num_threads,
+        ocr_scale=ocr_scale,
+    )
+
+
+@st.cache_resource(show_spinner=False)
+def get_cached_llm_client(host: str = "http://localhost:11434") -> dict:
+    """
+    Inicializa y almacena en caché la verificación del cliente LLM local (Ollama).
+    """
+    is_ok, msg, models = check_ollama_connection(host)
+    return {"available": is_ok, "message": msg, "models": models}
 
 # Custom Styling for Financial Dashboard
 st.markdown("""
@@ -275,12 +305,18 @@ def main():
         col_check, col_list = st.columns([1, 1])
         check_conn = st.button("🔌 Probar Conexión", width="stretch")
 
-        # Connection status feedback
-        if check_conn or "ollama_status" not in st.session_state:
-            is_ok, msg, models = check_ollama_connection(ollama_url)
-            st.session_state["ollama_status"] = is_ok
-            st.session_state["ollama_msg"] = msg
-            st.session_state["available_models"] = models
+        # Connection status feedback via cached resource
+        if check_conn:
+            get_cached_llm_client.clear()
+            llm_info = get_cached_llm_client(ollama_url)
+            st.session_state["ollama_status"] = llm_info["available"]
+            st.session_state["ollama_msg"] = llm_info["message"]
+            st.session_state["available_models"] = llm_info["models"]
+        elif "ollama_status" not in st.session_state:
+            llm_info = get_cached_llm_client(ollama_url)
+            st.session_state["ollama_status"] = llm_info["available"]
+            st.session_state["ollama_msg"] = llm_info["message"]
+            st.session_state["available_models"] = llm_info["models"]
 
         if st.session_state.get("ollama_status"):
             st.success(f"✅ {st.session_state.get('ollama_msg')}")
@@ -857,12 +893,18 @@ def main():
                                 all_extracted.append(t_obj)
                                 file_prev_txs.append(t_obj)
                             rec_conc = rec.get("conciliado")
-                            conc_bool = bool(rec_conc) if rec_conc is not None else None
+                            diff_db = rec.get("diferencia_conciliacion")
+                            s_ini_val = float(rec["saldo_inicial"]) if rec.get("saldo_inicial") is not None else 0.0
+                            s_fin_val = float(rec["saldo_final"]) if rec.get("saldo_final") is not None else 0.0
+                            diff_val = float(diff_db) if diff_db is not None else 0.0
+                            cuadra_val = bool(rec_conc) if rec_conc is not None else (diff_val <= 0.01)
                             st.session_state["reconciliation_reports"][fname] = ReconciliacionResultado(
-                                saldo_inicial=rec.get("saldo_inicial"),
-                                saldo_final_declarado=rec.get("saldo_final"),
-                                diferencia=rec.get("diferencia_conciliacion"),
-                                conciliado=conc_bool,
+                                saldo_inicial=s_ini_val,
+                                saldo_final_esperado=s_fin_val,
+                                saldo_final_declarado=s_fin_val,
+                                diferencia=diff_val,
+                                cuadra=cuadra_val,
+                                conciliado=cuadra_val,
                             )
                         continue
 
@@ -875,12 +917,18 @@ def main():
                         mark_checkpoint_file_completed(batch_id, fname)
                         completed_files_set.add(fname)
                         rec_conc = dup_record.get("conciliado")
-                        conc_bool = bool(rec_conc) if rec_conc is not None else None
+                        diff_db = dup_record.get("diferencia_conciliacion")
+                        s_ini_val = float(dup_record["saldo_inicial"]) if dup_record.get("saldo_inicial") is not None else 0.0
+                        s_fin_val = float(dup_record["saldo_final"]) if dup_record.get("saldo_final") is not None else 0.0
+                        diff_val = float(diff_db) if diff_db is not None else 0.0
+                        cuadra_val = bool(rec_conc) if rec_conc is not None else (diff_val <= 0.01)
                         st.session_state["reconciliation_reports"][fname] = ReconciliacionResultado(
-                            saldo_inicial=dup_record.get("saldo_inicial"),
-                            saldo_final_declarado=dup_record.get("saldo_final"),
-                            diferencia=dup_record.get("diferencia_conciliacion"),
-                            conciliado=conc_bool,
+                            saldo_inicial=s_ini_val,
+                            saldo_final_esperado=s_fin_val,
+                            saldo_final_declarado=s_fin_val,
+                            diferencia=diff_val,
+                            cuadra=cuadra_val,
+                            conciliado=cuadra_val,
                         )
                         continue
 
@@ -1099,19 +1147,26 @@ def main():
                     rec_f = db_files.get(up_f.name)
                     if rec_f and (rec_f.get("saldo_inicial") is not None or rec_f.get("saldo_final") is not None or rec_f.get("conciliado") is not None):
                         c_val = bool(rec_f.get("conciliado")) if rec_f.get("conciliado") is not None else None
+                        diff_f = rec_f.get("diferencia_conciliacion")
+                        s_ini = float(rec_f["saldo_inicial"]) if rec_f.get("saldo_inicial") is not None else 0.0
+                        s_fin = float(rec_f["saldo_final"]) if rec_f.get("saldo_final") is not None else 0.0
+                        diff_val = float(diff_f) if diff_f is not None else 0.0
+                        cuadra_val = c_val if c_val is not None else (diff_val <= 0.01)
                         reconciliation_reports[up_f.name] = ReconciliacionResultado(
-                            saldo_inicial=rec_f.get("saldo_inicial"),
-                            saldo_final_declarado=rec_f.get("saldo_final"),
-                            diferencia=rec_f.get("diferencia_conciliacion"),
-                            conciliado=c_val
+                            saldo_inicial=s_ini,
+                            saldo_final_esperado=s_fin,
+                            saldo_final_declarado=s_fin,
+                            diferencia=diff_val,
+                            cuadra=cuadra_val,
+                            conciliado=cuadra_val,
                         )
                 st.session_state["reconciliation_reports"] = reconciliation_reports
 
             if reconciliation_reports:
                 st.markdown("#### ⚖️ Verificación de Certeza Contable (Conciliación de Saldos)")
                 st.caption(
-                    "Conciliación aritmética automática: comprueba si el Saldo Inicial + Ingresos - Egresos "
-                    "cuadra con el Saldo Final declarado en el estado de cuenta bancario."
+                    "Conciliación aritmética automática: comprueba si el Saldo Inicial + Abonos (Ingresos) - Cargos (Egresos) "
+                    "cuadra con el Saldo Final esperado en el estado de cuenta bancario (tolerancia <= $0.01)."
                 )
 
                 for r_fname, r_data in reconciliation_reports.items():
@@ -1119,33 +1174,39 @@ def main():
                     if not isinstance(r_res, ReconciliacionResultado):
                         continue
 
-                    if r_res.conciliado is True:
+                    # Determinar estado de certeza contable (cuadra == True/False y diferencia)
+                    is_cuadra = r_res.cuadra if r_res.cuadra is not None else (
+                        (r_res.diferencia <= 0.01) if r_res.diferencia is not None else r_res.conciliado
+                    )
+                    diff_val = r_res.diferencia if r_res.diferencia is not None else 0.0
+                    abonos_val = r_res.total_abonos if r_res.total_abonos else r_res.total_ingresos
+                    cargos_val = r_res.total_cargos if r_res.total_cargos else r_res.total_egresos
+                    s_fin_esp = r_res.saldo_final_esperado if r_res.saldo_final_esperado is not None else r_res.saldo_final_declarado
+
+                    if is_cuadra is True:
                         badge_color = "#2e7d32"
                         badge_bg = "#e8f5e9"
                         border_color = "#a5d6a7"
-                        status_label = "Conciliado Exacto"
-                        status_badge = f"<span style='background-color:#2e7d32; color:white; padding:4px 10px; border-radius:12px; font-weight:700; font-size:12px;'>✅ {status_label}</span>"
-                        note = "Los movimientos extraídos cuadran con total precisión aritmética respecto a los saldos del documento."
-                    elif r_res.conciliado is False:
+                        status_badge = f"<span style='background-color:#2e7d32; color:white; padding:4px 12px; border-radius:12px; font-weight:700; font-size:12px;'>✅ Cuadra: True | Diferencia: ${diff_val:,.2f}</span>"
+                        note = "Los movimientos extraídos cuadran con total certeza contable respecto a los saldos del documento (diferencia <= $0.01)."
+                    elif is_cuadra is False:
                         badge_color = "#c62828"
                         badge_bg = "#ffebee"
                         border_color = "#ef9a9a"
-                        status_label = "Discrepancia Detectada"
-                        status_badge = f"<span style='background-color:#c62828; color:white; padding:4px 10px; border-radius:12px; font-weight:700; font-size:12px;'>⚠️ {status_label}</span>"
-                        diff_val = r_res.diferencia if r_res.diferencia is not None else 0.0
-                        note = f"Diferencia detectada de ${diff_val:,.2f} entre el saldo final calculado y el declarado. Verifique posibles movimientos omitidos o comisiones."
+                        status_badge = f"<span style='background-color:#c62828; color:white; padding:4px 12px; border-radius:12px; font-weight:700; font-size:12px;'>⚠️ Cuadra: False | Diferencia: ${diff_val:,.2f}</span>"
+                        note = f"Discrepancia contable detectada de ${diff_val:,.2f} entre el saldo final calculado y el esperado. Verifique posibles movimientos omitidos o comisiones."
                     else:
                         badge_color = "#616161"
                         badge_bg = "#f5f5f5"
                         border_color = "#e0e0e0"
-                        status_label = "Sin Saldos Declarados en Documento"
-                        status_badge = f"<span style='background-color:#9e9e9e; color:white; padding:4px 10px; border-radius:12px; font-weight:700; font-size:12px;'>⚪ {status_label}</span>"
+                        status_badge = f"<span style='background-color:#9e9e9e; color:white; padding:4px 12px; border-radius:12px; font-weight:700; font-size:12px;'>⚪ Sin Saldos Declarados</span>"
                         note = "El documento no cuenta con saldos de apertura y cierre explícitos en su texto o estructura XML para validar matemáticamente."
 
                     s_ini_str = f"${r_res.saldo_inicial:,.2f}" if r_res.saldo_inicial is not None else "N/D"
                     s_fin_calc_str = f"${r_res.saldo_final_calculado:,.2f}" if r_res.saldo_final_calculado is not None else "N/D"
-                    s_fin_dec_str = f"${r_res.saldo_final_declarado:,.2f}" if r_res.saldo_final_declarado is not None else "N/D"
-                    diff_str = f"${r_res.diferencia:,.2f}" if r_res.diferencia is not None else "N/D"
+                    s_fin_esp_str = f"${s_fin_esp:,.2f}" if s_fin_esp is not None else "N/D"
+                    diff_str = f"${diff_val:,.2f}"
+                    cuadra_text = "True ✅" if is_cuadra is True else ("False ❌" if is_cuadra is False else "N/D")
 
                     st.markdown(
                         f"""
@@ -1156,11 +1217,12 @@ def main():
                             </div>
                             <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(130px, 1fr)); gap: 10px; font-size: 13px; color: #333; margin-bottom: 6px;">
                                 <div><small style="color: #666;">Saldo Inicial</small><br><b>{s_ini_str}</b></div>
-                                <div><small style="color: #666;">Ingresos</small><br><b style="color: #2e7d32;">${r_res.total_ingresos:,.2f}</b></div>
-                                <div><small style="color: #666;">Egresos</small><br><b style="color: #c62828;">${r_res.total_egresos:,.2f}</b></div>
+                                <div><small style="color: #666;">Abonos / Ingresos</small><br><b style="color: #2e7d32;">${abonos_val:,.2f}</b></div>
+                                <div><small style="color: #666;">Cargos / Egresos</small><br><b style="color: #c62828;">${cargos_val:,.2f}</b></div>
                                 <div><small style="color: #666;">Saldo Final Calculado</small><br><b>{s_fin_calc_str}</b></div>
-                                <div><small style="color: #666;">Saldo Final Declarado</small><br><b>{s_fin_dec_str}</b></div>
+                                <div><small style="color: #666;">Saldo Final Esperado</small><br><b>{s_fin_esp_str}</b></div>
                                 <div><small style="color: #666;">Diferencia</small><br><b style="color: {badge_color};">{diff_str}</b></div>
+                                <div><small style="color: #666;">¿Cuadra?</small><br><b style="color: {badge_color};">{cuadra_text}</b></div>
                             </div>
                             <div style="font-size: 12px; color: #616161; margin-top: 4px;"><i>{note}</i></div>
                         </div>

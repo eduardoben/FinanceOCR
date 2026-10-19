@@ -138,7 +138,10 @@ def render_clipboard_button(tsv_data: str, label: str = "Copiar a Portapapeles (
         </script>
     </div>
     """
-    st.components.v1.html(html_code, height=50)
+    try:
+        st.html(html_code, unsafe_allow_javascript=True)
+    except Exception:
+        st.components.v1.html(html_code, height=50)
 
 
 def reconcile_transactions(
@@ -199,7 +202,7 @@ def reconcile_transactions(
         calc_final = calc_credito
         diff = diff_credito
 
-    conciliado = diff <= 0.05
+    cuadra = diff <= 0.01
 
     return ReconciliacionResultado(
         saldo_inicial=s_ini,
@@ -208,7 +211,8 @@ def reconcile_transactions(
         total_ingresos=total_ingresos,
         total_egresos=total_egresos,
         diferencia=diff,
-        conciliado=conciliado,
+        cuadra=cuadra,
+        conciliado=cuadra,
         modo_calculo=modo
     )
 

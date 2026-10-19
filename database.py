@@ -88,6 +88,27 @@ def db_session(db_path: str = DEFAULT_DB_PATH) -> Generator[sqlite3.Connection, 
 _INITIALIZED_DBS: set[str] = set()
 
 
+def hash_sha256(file_bytes: bytes) -> str:
+    """
+    Calcula el hash criptográfico SHA-256 sobre el contenido binario del archivo
+    para identificar de forma única cada estado de cuenta y evitar colisiones de nombre.
+
+    Args:
+        file_bytes: Contenido binario del archivo subido (PDF o XML).
+
+    Returns:
+        str: Digest hexadecimal en minúsculas de 64 caracteres.
+    """
+    return hashlib.sha256(file_bytes).hexdigest()
+
+
+def compute_file_hash(file_bytes: bytes) -> str:
+    """
+    Alias retrocompatible para hash_sha256.
+    """
+    return hash_sha256(file_bytes)
+
+
 def init_db(db_path: str = DEFAULT_DB_PATH) -> None:
     """
     Initializes database schema and B-Tree indexes if they do not already exist.
@@ -96,7 +117,7 @@ def init_db(db_path: str = DEFAULT_DB_PATH) -> None:
     Args:
         db_path: Target database file path.
     """
-    abs_p = os.path.abspath(db_path)
+    abs_p = os.path.normcase(os.path.abspath(db_path))
     if abs_p in _INITIALIZED_DBS and os.path.exists(abs_p):
         return
 
@@ -289,17 +310,7 @@ def get_document_file_bytes(
     return None
 
 
-def compute_file_hash(file_bytes: bytes) -> str:
-    """
-    Computes a cryptographic SHA-256 digest from binary file content.
-
-    Args:
-        file_bytes: Raw bytes of the uploaded PDF or XML file.
-
-    Returns:
-        str: 64-character lowercase hexadecimal hash.
-    """
-    return hashlib.sha256(file_bytes).hexdigest()
+# Note: hash_sha256 and compute_file_hash are defined above.
 
 
 def check_file_processed(

@@ -8,8 +8,10 @@ deterministic Mexican CFDI / XML parsing via lxml.
 """
 
 import os
+import re
 import time
 import functools
+import threading
 import multiprocessing
 from typing import List, Tuple, Optional, Dict, Any
 from PIL import Image
@@ -30,8 +32,37 @@ from docling.datamodel.pipeline_options import (
 )
 from docling.backend.pypdfium2_backend import PyPdfiumDocumentBackend
 
-# Global converter instance registry to eliminate cold-start overhead
+# Global converter instance registry to eliminate cold-start overhead (thread-safe singleton)
 _CONVERTERS_CACHE: Dict[Tuple[bool, bool, int, float], DocumentConverter] = {}
+_CONVERTER_LOCK = threading.Lock()
+
+# Precompiled word-boundary regular expressions for Mexican CFDI financial flow classification
+EXPENSE_KEYWORDS = [
+    "CGO", "CARGO", "RETIRO", "DISPOSICION", "CAJERO",
+    "PAGO DE TARJETA", "PAGO TARJETA", "PAGO SERVICIO", "PAGO DE SERVICIOS",
+    "PORTABILIDAD", "PORTABILIDAD DE NOMINA",
+    "TRANSFERENCIA A", "TRANSFERENCIA INTERBANCARIA", "SPEI ENVIADO",
+    "TRASPASO A", "COMPRA", "CONSUMO", "COMISION", "IVA", "VALIDACION"
+]
+INCOME_KEYWORDS = [
+    "SU PAGO GRACIAS", "PAGO GRACIAS", "SU PAGO",
+    "NOMINA", "SUELDO", "HONORARIOS",
+    "PAGO DE BECA", "DEPOSITO BECA", "BECA",
+    "HACIENDA TE DEVUELVE", "DEVOLUCION", "REEMBOLSO",
+    "BONIFICACION", "CASHBACK", "2NOW", "RECOMPENSA", "SALDO A FAVOR",
+    "ABONO", "ABO", "DEPOSITO", "DEP",
+    "SPEI RECIBIDO", "TRANSFERENCIA RECIBIDA", "TRASPASO RECIBIDO",
+    "INTERESES GANADOS", "RENDIMIENTOS"
+]
+
+EXPENSE_REGEX = re.compile(
+    r"\b(?:" + "|".join(re.escape(k.strip()) for k in sorted(EXPENSE_KEYWORDS, key=len, reverse=True)) + r")\b",
+    re.IGNORECASE
+)
+INCOME_REGEX = re.compile(
+    r"\b(?:" + "|".join(re.escape(k.strip()) for k in sorted(INCOME_KEYWORDS, key=len, reverse=True)) + r")\b",
+    re.IGNORECASE
+)
 
 
 def detect_pdf_profile(
@@ -142,44 +173,46 @@ def get_cached_converter(
 ) -> DocumentConverter:
     """
     Retrieves or creates a cached DocumentConverter instance with tailored
-    accelerator and OCR pipeline options, preventing repeated model initialization.
+    accelerator and OCR pipeline options in a thread-safe manner, preventing
+    repeated model initialization.
     """
     if num_threads is None:
         cpu_cores = multiprocessing.cpu_count() or 4
         num_threads = min(cpu_cores, 12)
 
     cache_key = (enable_ocr, accurate_tables, num_threads, ocr_scale)
-    if cache_key in _CONVERTERS_CACHE:
-        return _CONVERTERS_CACHE[cache_key]
+    with _CONVERTER_LOCK:
+        if cache_key in _CONVERTERS_CACHE:
+            return _CONVERTERS_CACHE[cache_key]
 
-    pipeline_options = PdfPipelineOptions()
-    pipeline_options.do_ocr = enable_ocr
-    pipeline_options.do_table_structure = True
-    pipeline_options.table_structure_options.mode = (
-        TableFormerMode.ACCURATE if accurate_tables else TableFormerMode.FAST
-    )
-    pipeline_options.accelerator_options = AcceleratorOptions(
-        num_threads=num_threads,
-        device="auto"
-    )
-
-    if enable_ocr:
-        pipeline_options.ocr_options = RapidOcrOptions(
-            scale=ocr_scale,
-            backend="onnxruntime"
+        pipeline_options = PdfPipelineOptions()
+        pipeline_options.do_ocr = enable_ocr
+        pipeline_options.do_table_structure = True
+        pipeline_options.table_structure_options.mode = (
+            TableFormerMode.ACCURATE if accurate_tables else TableFormerMode.FAST
+        )
+        pipeline_options.accelerator_options = AcceleratorOptions(
+            num_threads=num_threads,
+            device="auto"
         )
 
-    converter = DocumentConverter(
-        format_options={
-            InputFormat.PDF: PdfFormatOption(
-                pipeline_options=pipeline_options,
-                backend=PyPdfiumDocumentBackend,
+        if enable_ocr:
+            pipeline_options.ocr_options = RapidOcrOptions(
+                scale=ocr_scale,
+                backend="onnxruntime"
             )
-        }
-    )
 
-    _CONVERTERS_CACHE[cache_key] = converter
-    return converter
+        converter = DocumentConverter(
+            format_options={
+                InputFormat.PDF: PdfFormatOption(
+                    pipeline_options=pipeline_options,
+                    backend=PyPdfiumDocumentBackend,
+                )
+            }
+        )
+
+        _CONVERTERS_CACHE[cache_key] = converter
+        return converter
 
 
 def parse_pdf(
@@ -639,24 +672,6 @@ def _parse_single_cfdi(comp: etree._Element, user_rfc: Optional[str] = None) -> 
         cuenta_clean = re.sub(r"\D", "", cuenta)
         is_credit_card = bool(mov_fiscales) or len(cuenta_clean) == 16 or cuenta.strip().startswith("5470")
 
-        expense_kw = [
-            "CGO", "CARGO", "RETIRO", "DISPOSICION", "CAJERO",
-            "PAGO DE TARJETA", "PAGO TARJETA", "PAGO SERVICIO", "PAGO DE SERVICIOS",
-            "PORTABILIDAD", "PORTABILIDAD DE NOMINA",
-            "TRANSFERENCIA A", "TRANSFERENCIA INTERBANCARIA", "SPEI ENVIADO",
-            "TRASPASO A", "COMPRA", "CONSUMO", "COMISION", "IVA", "VALIDACION"
-        ]
-        income_kw = [
-            "SU PAGO GRACIAS", "PAGO GRACIAS", "SU PAGO",
-            "NOMINA", "SUELDO", "HONORARIOS",
-            "PAGO DE BECA", "DEPOSITO BECA", "BECA",
-            "HACIENDA TE DEVUELVE", "DEVOLUCION", "REEMBOLSO",
-            "BONIFICACION", "CASHBACK", "2NOW", "RECOMPENSA", "SALDO A FAVOR",
-            "ABONO", "ABO ", "DEPOSITO", "DEP ",
-            "SPEI RECIBIDO", "TRANSFERENCIA RECIBIDA", "TRASPASO RECIBIDO",
-            "INTERESES GANADOS", "RENDIMIENTOS"
-        ]
-
         for m in addenda_movs:
             tag_name = m.tag.split("}")[-1] if "}" in m.tag else m.tag
             m_fecha_raw = m.get("fecha") or m.get("Fecha") or fecha
@@ -685,24 +700,17 @@ def _parse_single_cfdi(comp: etree._Element, user_rfc: Optional[str] = None) -> 
                 extra = m_desc
             else:
                 d_upper = m_desc.upper()
-                m_flow = None
-                for kw in expense_kw:
-                    if re.search(rf"\b{re.escape(kw)}\b", d_upper):
-                        m_flow = TipoTransaccion.EGRESO
-                        break
-                if not m_flow:
-                    for kw in income_kw:
-                        if re.search(rf"\b{re.escape(kw)}\b", d_upper):
-                            m_flow = TipoTransaccion.INGRESO
-                            break
-                if not m_flow:
-                    if is_credit_card:
-                        if re.search(r"\bPAGO[S]?\b", d_upper):
-                            m_flow = TipoTransaccion.INGRESO
-                        else:
-                            m_flow = TipoTransaccion.EGRESO
+                if EXPENSE_REGEX.search(d_upper):
+                    m_flow = TipoTransaccion.EGRESO
+                elif INCOME_REGEX.search(d_upper):
+                    m_flow = TipoTransaccion.INGRESO
+                elif is_credit_card:
+                    if re.search(r"\bPAGO[S]?\b", d_upper):
+                        m_flow = TipoTransaccion.INGRESO
                     else:
-                        m_flow = default_tipo
+                        m_flow = TipoTransaccion.EGRESO
+                else:
+                    m_flow = default_tipo
                 extra = m_desc
 
             if cuenta:

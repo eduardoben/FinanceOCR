@@ -18,7 +18,14 @@ from parsers import (
     render_pdf_page_image,
     get_cached_converter,
     parse_pdf,
+    parse_xml,
     _CONVERTERS_CACHE,
+)
+from models import Transaccion, TipoTransaccion
+from llm_client import (
+    deduplicate_adjacent_chunks,
+    deduplicate_all_chunks,
+    deduplicate_within_chunk,
 )
 
 
@@ -156,6 +163,86 @@ startxref
         self.assertEqual(meta2["pages_processed"], 1)
         self.assertIn("PAGINA 2", md_text2)
         self.assertNotIn("PAGINA 1", md_text2)
+
+    def test_adjacent_chunk_deduplication(self):
+        """
+        Verifies that deduplicate_adjacent_chunks removes overlapping row duplicates
+        at chunk boundaries (tail of chunk_i vs head of chunk_i+1), while preserving
+        legitimate identical twin transactions within the same chunk unless they share
+        an explicit bank reference.
+        """
+        # 1. Overlapping boundary test
+        tx1 = Transaccion(fecha="2024-01-10", concepto="Restaurante", importe=250.0, descripcion="Comida", tipo=TipoTransaccion.EGRESO)
+        tx2 = Transaccion(fecha="2024-01-11", concepto="Gasolina", importe=600.0, descripcion="Carga combustible", tipo=TipoTransaccion.EGRESO)
+        tx_boundary = Transaccion(fecha="2024-01-12", concepto="Supermercado", importe=1250.50, descripcion="Compra semanal despensa", tipo=TipoTransaccion.EGRESO)
+
+        # Chunk 1 ends with tx_boundary
+        chunk_1 = [tx1, tx2, tx_boundary]
+
+        # Chunk 2 repeats tx_boundary at the start due to table chunk overlap
+        tx_boundary_dup = Transaccion(fecha="2024-01-12", concepto="Supermercado", importe=1250.50, descripcion="Compra semanal despensa", tipo=TipoTransaccion.EGRESO)
+        tx3 = Transaccion(fecha="2024-01-13", concepto="Farmacia", importe=180.0, descripcion="Medicamentos", tipo=TipoTransaccion.EGRESO)
+        chunk_2 = [tx_boundary_dup, tx3]
+
+        deduped_next = deduplicate_adjacent_chunks(chunk_1, chunk_2, boundary_window=3)
+        # tx_boundary_dup must be removed, leaving only tx3
+        self.assertEqual(len(deduped_next), 1)
+        self.assertEqual(deduped_next[0].concepto, "Farmacia")
+
+        # 2. Legitimate same-day twins within same chunk (e.g. 2 identical coffees at same cafe without ref)
+        tx_twin1 = Transaccion(fecha="2024-01-15", concepto="Cafetería", importe=65.0, descripcion="Café latte", tipo=TipoTransaccion.EGRESO)
+        tx_twin2 = Transaccion(fecha="2024-01-15", concepto="Cafetería", importe=65.0, descripcion="Café latte", tipo=TipoTransaccion.EGRESO)
+        twins_chunk = [tx_twin1, tx_twin2]
+
+        preserved = deduplicate_within_chunk(twins_chunk)
+        self.assertEqual(len(preserved), 2, "Identical transactions without explicit bank reference must both be preserved.")
+
+        # 3. Duplicate transactions with explicit identical bank reference must be deduplicated
+        tx_ref1 = Transaccion(fecha="2024-01-15", concepto="Pago", importe=100.0, descripcion="Pago servicio Ref: 12345678", tipo=TipoTransaccion.EGRESO)
+        tx_ref2 = Transaccion(fecha="2024-01-15", concepto="Pago", importe=100.0, descripcion="Pago servicio Ref: 12345678", tipo=TipoTransaccion.EGRESO)
+        ref_chunk = [tx_ref1, tx_ref2]
+
+        deduped_refs = deduplicate_within_chunk(ref_chunk)
+        self.assertEqual(len(deduped_refs), 1, "Transactions with identical explicit bank reference should be deduplicated.")
+
+        # 4. Multi-chunk end-to-end pipeline
+        all_deduped = deduplicate_all_chunks([chunk_1, chunk_2, twins_chunk])
+        self.assertEqual(len(all_deduped), 6)  # 3 from chunk 1 + 1 from chunk 2 + 2 from twins chunk
+
+    def test_secure_xml_cfdi_parsing_fixtures(self):
+        """
+        Verifies secure parsing of Mexican CFDI XML fixtures (credit card and debit card)
+        with etree.XMLParser(resolve_entities=False, no_network=True, recover=True).
+        """
+        fixtures_dir = os.path.join(os.path.dirname(__file__), "tests", "fixtures")
+        credito_path = os.path.join(fixtures_dir, "dummy_xml_credito.xml")
+        debito_path = os.path.join(fixtures_dir, "dummy_xml_debito.xml")
+
+        self.assertTrue(os.path.exists(credito_path), f"Fixture missing: {credito_path}")
+        self.assertTrue(os.path.exists(debito_path), f"Fixture missing: {debito_path}")
+
+        # 1. Test credit card XML fixture
+        txs_cred, raw_cred = parse_xml(credito_path)
+        self.assertIsNotNone(txs_cred, "dummy_xml_credito.xml should be parsed deterministically")
+        self.assertGreater(len(txs_cred), 0)
+        # Verify movements contain expected amounts and types
+        importes_cred = [tx.importe for tx in txs_cred]
+        self.assertIn(35000.0, importes_cred)
+        self.assertIn(4000.0, importes_cred)
+        self.assertIn(755.0, importes_cred)
+        for tx in txs_cred:
+            self.assertIn(tx.tipo, (TipoTransaccion.INGRESO, TipoTransaccion.EGRESO))
+            self.assertRegex(tx.fecha, r"^\d{4}-\d{2}-\d{2}$")
+
+        # 2. Test debit card XML fixture
+        txs_deb, raw_deb = parse_xml(debito_path)
+        self.assertIsNotNone(txs_deb, "dummy_xml_debito.xml should be parsed deterministically")
+        self.assertEqual(len(txs_deb), 3)
+        importes_deb = [tx.importe for tx in txs_deb]
+        self.assertEqual(importes_deb, [1000.0, 2000.0, 3000.0])
+        for tx in txs_deb:
+            self.assertIn(tx.tipo, (TipoTransaccion.INGRESO, TipoTransaccion.EGRESO))
+            self.assertRegex(tx.fecha, r"^\d{4}-\d{2}-\d{2}$")
 
 
 if __name__ == "__main__":

@@ -21,6 +21,7 @@ from models import Transaccion, TipoTransaccion
 from database import (
     db_session,
     init_db,
+    hash_sha256,
     compute_file_hash,
     check_file_processed,
     save_processed_transactions,
@@ -35,6 +36,8 @@ from database import (
     mark_checkpoint_file_completed,
     mark_checkpoint_interrupted,
     clear_batch_checkpoint,
+    get_db_connection,
+    _INITIALIZED_DBS,
 )
 
 
@@ -88,7 +91,106 @@ class TestDatabaseLayer(unittest.TestCase):
 
         self.assertEqual(len(hash1), 64)
         self.assertEqual(hash1, compute_file_hash(content1))
+        self.assertEqual(hash1, hash_sha256(content1))
         self.assertNotEqual(hash1, hash2)
+
+    def test_same_filename_different_binary_distinct_hashes_without_overwriting(self):
+        """
+        Validates that two files with the exact same filename but different binary content
+        produce distinct SHA-256 hashes and are stored without overwriting each other.
+        """
+        same_filename = "estado_de_cuenta_compartido.pdf"
+        binary_1 = b"%PDF-1.4 Content for Account A - Enero 2024"
+        binary_2 = b"%PDF-1.4 Content for Account B - Febrero 2024"
+
+        h1 = hash_sha256(binary_1)
+        h2 = hash_sha256(binary_2)
+
+        self.assertNotEqual(h1, h2)
+        self.assertEqual(len(h1), 64)
+        self.assertEqual(len(h2), 64)
+
+        txs_1 = [
+            Transaccion(
+                fecha="2024-01-15",
+                concepto="Abono Cliente 1",
+                importe=12000.0,
+                descripcion="Transferencia",
+                tipo=TipoTransaccion.INGRESO
+            )
+        ]
+        txs_2 = [
+            Transaccion(
+                fecha="2024-02-15",
+                concepto="Cargo Proveedor 2",
+                importe=4500.0,
+                descripcion="Pago factura",
+                tipo=TipoTransaccion.EGRESO
+            )
+        ]
+
+        id1 = save_processed_transactions(
+            filename=same_filename,
+            file_hash=h1,
+            file_type="pdf",
+            transactions=txs_1,
+            file_bytes=binary_1,
+            overwrite=False,
+            db_path=self.db_path
+        )
+
+        id2 = save_processed_transactions(
+            filename=same_filename,
+            file_hash=h2,
+            file_type="pdf",
+            transactions=txs_2,
+            file_bytes=binary_2,
+            overwrite=False,
+            db_path=self.db_path
+        )
+
+        self.assertNotEqual(id1, id2)
+
+        # Both records must coexist without collisions or data loss
+        rec1 = check_file_processed(same_filename, h1, db_path=self.db_path)
+        rec2 = check_file_processed(same_filename, h2, db_path=self.db_path)
+
+        self.assertIsNotNone(rec1)
+        self.assertIsNotNone(rec2)
+        self.assertEqual(rec1["id"], id1)
+        self.assertEqual(rec2["id"], id2)
+        self.assertEqual(rec1["hash_sha256"], h1)
+        self.assertEqual(rec2["hash_sha256"], h2)
+        self.assertEqual(rec1["nombre_archivo"], same_filename)
+        self.assertEqual(rec2["nombre_archivo"], same_filename)
+
+        # Database statistics must reflect exactly 2 distinct files and 2 transactions
+        stats = get_database_stats(self.db_path)
+        self.assertEqual(stats["total_archivos"], 2)
+        self.assertEqual(stats["total_transacciones"], 2)
+
+    def test_sqlite_pragmas_wal_foreign_keys_synchronous(self):
+        """Verifies that PRAGMA journal_mode=WAL, PRAGMA synchronous=NORMAL, and PRAGMA foreign_keys=ON are active."""
+        conn = get_db_connection(self.db_path)
+        try:
+            fk = conn.execute("PRAGMA foreign_keys;").fetchone()[0]
+            jm = conn.execute("PRAGMA journal_mode;").fetchone()[0]
+            sync = conn.execute("PRAGMA synchronous;").fetchone()[0]
+
+            self.assertEqual(fk, 1)  # ON
+            self.assertEqual(jm.lower(), "wal")
+            # SQLite synchronous: 1 corresponds to NORMAL (0=OFF, 1=NORMAL, 2=FULL, 3=EXTRA)
+            self.assertEqual(sync, 1)
+        finally:
+            conn.close()
+
+    def test_initialized_dbs_registry_prevents_duplicate_ddl(self):
+        """Verifies that _INITIALIZED_DBS records initialized databases."""
+        abs_p = os.path.normcase(os.path.abspath(self.db_path))
+        self.assertIn(abs_p, _INITIALIZED_DBS)
+        # Calling init_db again should cleanly return without error
+        init_db(self.db_path)
+        self.assertIn(abs_p, _INITIALIZED_DBS)
 
     def test_save_and_duplicate_detection(self):
         """Verifies saving transactions and retrieving duplicate detection metadata."""
