@@ -16,7 +16,7 @@ from typing import Optional, List, Dict, Any, Tuple
 import pandas as pd
 import streamlit as st
 
-from models import Transaccion, TipoTransaccion, ReconciliacionResultado
+from models import Transaccion, TipoTransaccion, ReconciliacionResultado, clasificar_estado_documento
 from parsers import (
     parse_pdf,
     parse_xml,
@@ -26,6 +26,12 @@ from parsers import (
     resolve_xml_strategy,
     extract_statement_balances,
     get_cached_converter,
+    infer_statement_mode,
+    parse_docling_markdown_tables,
+    validate_running_balance_chain,
+    identify_low_confidence_pages,
+    reextract_pages_high_res,
+    reconcile_extraction_passes,
 )
 from llm_client import check_ollama_connection, extract_transactions_with_ollama
 from telemetry import render_telemetry_expander, StageStopwatch
@@ -44,6 +50,7 @@ from database import (
     save_processed_transactions,
     query_transactions,
     get_distinct_files,
+    get_filas_rechazadas,
     delete_processed_file,
     get_database_stats,
     save_document_file,
@@ -942,6 +949,8 @@ def main():
                     status_text.info(f"⏳ ({idx + 1}/{total_files}) Procesando archivo: **{fname}**...")
                     current_file_txs: list[Transaccion] = []
                     doc_raw_text = ""
+                    file_filas_rechazadas: list[dict] = []
+                    file_metrics: dict = {"cobertura": 1.0, "filas_candidatas": 0, "filas_extraidas": 0, "filas_rechazadas": []}
 
                     cfg = file_configs.get(fname, {})
 
@@ -1017,24 +1026,144 @@ def main():
                                 f"(Págs {meta['page_range'][0]}-{meta['page_range'][1]} de {meta['total_pages']})"
                             )
 
-                            status_text.info(f"⏳ ({idx + 1}/{total_files}) Extrayendo y clasificando con {file_model}...")
-                            stopwatch.start_stage(f"🤖 Inferencia Ollama ({file_model})")
-                            pdf_txs = extract_transactions_with_ollama(
+                            # Step 1: Pre-extract balances and infer mode
+                            doc_balances = extract_statement_balances(doc_raw_text)
+                            modo_inferred = infer_statement_mode(doc_raw_text, doc_balances)
+                            eff_mode = modo_inferred if modo_inferred != "ambiguo" else "debito"
+
+                            # Step 2: Deterministic extraction from Markdown tables
+                            status_text.info(f"⏳ ({idx + 1}/{total_files}) Analizando tablas estructuradas Docling: **{fname}**...")
+                            stopwatch.start_stage("📑 Tablas Deterministas Markdown")
+                            table_txs, unparsed_lines, table_meta = parse_docling_markdown_tables(
                                 markdown_tables,
-                                base_url=ollama_url,
-                                model=file_model,
-                                num_ctx=num_ctx
+                                modo_contable=eff_mode
                             )
-                            current_file_txs.extend(pdf_txs)
+
+                            if table_txs:
+                                validated_table_txs, chain_meta = validate_running_balance_chain(
+                                    table_txs,
+                                    saldo_inicial=doc_balances.get("saldo_inicial"),
+                                    modo_contable=eff_mode
+                                )
+                                # Targeted high-resolution second pass on suspicious pages (Fase 4)
+                                low_pages = identify_low_confidence_pages(
+                                    validated_table_txs,
+                                    filas_rechazadas=file_filas_rechazadas,
+                                    cobertura=1.0,
+                                    modo_contable=eff_mode
+                                )
+                                if low_pages:
+                                    status_text.info(f"🔍 ({idx + 1}/{total_files}) Verificación dirigida en páginas dudosas {low_pages}: **{fname}**...")
+                                    stopwatch.start_stage("🔍 Verificación Dirigida ACCURATE")
+                                    with tempfile.NamedTemporaryFile("wb", suffix=".pdf", delete=False) as tmp_pdf:
+                                        tmp_pdf.write(file.getvalue())
+                                        tmp_pdf_p = tmp_pdf.name
+                                    try:
+                                        p2_md_dict = reextract_pages_high_res(tmp_pdf_p, low_pages)
+                                        for p_num, p2_md in p2_md_dict.items():
+                                            p2_txs, _, _ = parse_docling_markdown_tables(
+                                                p2_md, modo_contable=eff_mode, default_page=p_num
+                                            )
+                                            if p2_txs:
+                                                p1_page_rows = [tx for tx in validated_table_txs if getattr(tx, "pagina", 1) == p_num]
+                                                rec_rows, rec_meta = reconcile_extraction_passes(
+                                                    p1_page_rows,
+                                                    p2_txs,
+                                                    modo_contable=eff_mode
+                                                )
+                                                if rec_meta.get("cadena_ok"):
+                                                    other_rows = [tx for tx in validated_table_txs if getattr(tx, "pagina", 1) != p_num]
+                                                    validated_table_txs = other_rows + rec_rows
+                                    finally:
+                                        try:
+                                            os.unlink(tmp_pdf_p)
+                                        except Exception:
+                                            pass
+                            else:
+                                validated_table_txs, chain_meta = [], {}
+
+                            # Step 3: Check if LLM inference is needed for unstructured or uncertain fragments
+                            needs_llm = False
+                            unparsed_chunks = ""
+                            if unparsed_lines:
+                                needs_llm = True
+                                unparsed_chunks = "\n".join(unparsed_lines)
+                            elif len(validated_table_txs) == 0:
+                                needs_llm = True
+                                unparsed_chunks = markdown_tables
+                            elif any(getattr(tx, "requiere_verificacion_llm", False) for tx in validated_table_txs):
+                                needs_llm = True
+                                prob_lines = [tx.linea_origen for tx in validated_table_txs if getattr(tx, "requiere_verificacion_llm", False)]
+                                unparsed_chunks = "\n".join(prob_lines)
+
+                            if needs_llm and unparsed_chunks.strip():
+                                status_text.info(f"⏳ ({idx + 1}/{total_files}) Verificando fragmentos con {file_model}...")
+                                stopwatch.start_stage(f"🤖 Inferencia Ollama ({file_model})")
+                                llm_txs, llm_metrics = extract_transactions_with_ollama(
+                                    unparsed_chunks,
+                                    base_url=ollama_url,
+                                    model=file_model,
+                                    num_ctx=num_ctx,
+                                    filas_rechazadas_out=file_filas_rechazadas,
+                                    return_metrics=True
+                                )
+                                if len(validated_table_txs) == 0:
+                                    current_file_txs.extend(llm_txs)
+                                    file_metrics = llm_metrics
+                                else:
+                                    clean_txs = [tx for tx in validated_table_txs if not getattr(tx, "requiere_verificacion_llm", False)]
+                                    current_file_txs.extend(clean_txs)
+                                    current_file_txs.extend(llm_txs)
+                                    tot_cands = table_meta.get("total_candidate_lines", len(current_file_txs))
+                                    file_metrics = {
+                                        "cobertura": 1.0 if tot_cands <= len(current_file_txs) else round(len(current_file_txs) / max(tot_cands, 1), 4),
+                                        "filas_candidatas": tot_cands,
+                                        "filas_extraidas": len(current_file_txs),
+                                        "filas_rechazadas": file_filas_rechazadas
+                                    }
+                            else:
+                                current_file_txs.extend(validated_table_txs)
+                                tot_cands = table_meta.get("total_candidate_lines", len(validated_table_txs))
+                                file_metrics = {
+                                    "cobertura": 1.0 if tot_cands <= len(validated_table_txs) else round(len(validated_table_txs) / max(tot_cands, 1), 4),
+                                    "filas_candidatas": tot_cands,
+                                    "filas_extraidas": len(validated_table_txs),
+                                    "filas_rechazadas": file_filas_rechazadas
+                                }
+                                st.toast(f"⚡ {fname}: {len(validated_table_txs)} movimientos extraídos de tablas Docling (0s LLM)", icon="📑")
 
                         # Balance extraction and Arithmetic Reconciliation
                         doc_balances = extract_statement_balances(doc_raw_text)
                         recon_res = reconcile_transactions(
                             current_file_txs,
                             doc_balances.get("saldo_inicial"),
-                            doc_balances.get("saldo_final")
+                            doc_balances.get("saldo_final"),
+                            text=doc_raw_text,
+                            summary_data=doc_balances
                         )
-                        st.session_state["reconciliation_reports"][fname] = recon_res
+
+                        # Classify document state
+                        cobertura_val = file_metrics.get("cobertura", 1.0) if file_metrics else 1.0
+                        tiene_saldos = doc_balances.get("saldo_inicial") is not None and doc_balances.get("saldo_final") is not None
+                        baja_conf_count = sum(1 for tx in current_file_txs if getattr(tx, "confianza", 1.0) < 0.75)
+                        estado_doc = clasificar_estado_documento(
+                            cuadra=recon_res.cuadra,
+                            modo_contable=recon_res.modo_contable,
+                            cobertura=cobertura_val,
+                            filas_rechazadas_count=len(file_filas_rechazadas),
+                            tiene_saldos=tiene_saldos,
+                            filas_baja_confianza_count=baja_conf_count
+                        )
+                        recon_res.estado_conciliacion = estado_doc
+
+                        st.session_state["reconciliation_reports"][fname] = {
+                            "resultado": recon_res,
+                            "estado": estado_doc,
+                            "cobertura": cobertura_val,
+                            "metricas": file_metrics,
+                            "filas_rechazadas": file_filas_rechazadas,
+                            "doc_balances": doc_balances
+                        }
 
                         # Auto-save immediately to SQLite with persistent document retention
                         if current_file_txs:
@@ -1049,6 +1178,11 @@ def main():
                                 saldo_final=recon_res.saldo_final_declarado,
                                 diferencia_conciliacion=recon_res.diferencia,
                                 conciliado=recon_res.conciliado,
+                                estado_conciliacion=estado_doc,
+                                modo_contable=recon_res.modo_contable,
+                                cobertura=cobertura_val,
+                                metricas_json=json.dumps(file_metrics, ensure_ascii=False) if file_metrics else None,
+                                filas_rechazadas=file_filas_rechazadas,
                             )
                             mark_checkpoint_file_completed(batch_id, fname)
                             completed_files_set.add(fname)
@@ -1169,67 +1303,103 @@ def main():
                     "cuadra con el Saldo Final esperado en el estado de cuenta bancario (tolerancia <= $0.01)."
                 )
 
+                has_unverified = False
                 for r_fname, r_data in reconciliation_reports.items():
-                    r_res = r_data.get("resultado") if isinstance(r_data, dict) and "resultado" in r_data else r_data
+                    if isinstance(r_data, dict):
+                        r_res = r_data.get("resultado")
+                        estado_doc = r_data.get("estado", "RECHAZADO")
+                        rechazadas = r_data.get("filas_rechazadas", [])
+                        cobertura_val = r_data.get("cobertura", 1.0)
+                    else:
+                        r_res = r_data
+                        cobertura_val = 1.0
+                        rechazadas = []
+                        estado_doc = getattr(r_res, "estado_conciliacion", None) or clasificar_estado_documento(
+                            cuadra=getattr(r_res, "cuadra", False),
+                            modo_contable=getattr(r_res, "modo_contable", "debito"),
+                            cobertura=cobertura_val,
+                            filas_rechazadas_count=len(rechazadas),
+                            tiene_saldos=(getattr(r_res, "saldo_inicial", None) is not None and getattr(r_res, "saldo_final_declarado", None) is not None)
+                        )
+
                     if not isinstance(r_res, ReconciliacionResultado):
                         continue
 
-                    # Determinar estado de certeza contable (cuadra == True/False y diferencia)
-                    is_cuadra = r_res.cuadra if r_res.cuadra is not None else (
-                        (r_res.diferencia <= 0.01) if r_res.diferencia is not None else r_res.conciliado
-                    )
+                    if estado_doc != "VERIFICADO":
+                        has_unverified = True
+
                     diff_val = r_res.diferencia if r_res.diferencia is not None else 0.0
                     abonos_val = r_res.total_abonos if r_res.total_abonos else r_res.total_ingresos
                     cargos_val = r_res.total_cargos if r_res.total_cargos else r_res.total_egresos
                     s_fin_esp = r_res.saldo_final_esperado if r_res.saldo_final_esperado is not None else r_res.saldo_final_declarado
+                    modo_str = getattr(r_res, "modo_contable", "debito").upper()
 
-                    if is_cuadra is True:
+                    if estado_doc == "VERIFICADO":
                         badge_color = "#2e7d32"
                         badge_bg = "#e8f5e9"
                         border_color = "#a5d6a7"
-                        status_badge = f"<span style='background-color:#2e7d32; color:white; padding:4px 12px; border-radius:12px; font-weight:700; font-size:12px;'>✅ Cuadra: True | Diferencia: ${diff_val:,.2f}</span>"
-                        note = "Los movimientos extraídos cuadran con total certeza contable respecto a los saldos del documento (diferencia <= $0.01)."
-                    elif is_cuadra is False:
+                        status_badge = f"<span style='background-color:#2e7d32; color:white; padding:4px 12px; border-radius:12px; font-weight:700; font-size:12px;'>🛡️ VERIFICADO</span>"
+                        note = f"Conciliado exitosamente en modo {modo_str} (diferencia <= $0.01) con cobertura >= 99% sin filas rechazadas."
+                    elif estado_doc == "REVISAR":
+                        badge_color = "#e65100"
+                        badge_bg = "#fff3e0"
+                        border_color = "#ffb74d"
+                        status_badge = f"<span style='background-color:#e65100; color:white; padding:4px 12px; border-radius:12px; font-weight:700; font-size:12px;'>⚠️ REVISAR</span>"
+                        note = "El documento requiere revisión manual (cobertura < 99%, filas rechazadas o saldos no declarados en el texto)."
+                    else:  # RECHAZADO
                         badge_color = "#c62828"
                         badge_bg = "#ffebee"
                         border_color = "#ef9a9a"
-                        status_badge = f"<span style='background-color:#c62828; color:white; padding:4px 12px; border-radius:12px; font-weight:700; font-size:12px;'>⚠️ Cuadra: False | Diferencia: ${diff_val:,.2f}</span>"
-                        note = f"Discrepancia contable detectada de ${diff_val:,.2f} entre el saldo final calculado y el esperado. Verifique posibles movimientos omitidos o comisiones."
-                    else:
-                        badge_color = "#616161"
-                        badge_bg = "#f5f5f5"
-                        border_color = "#e0e0e0"
-                        status_badge = f"<span style='background-color:#9e9e9e; color:white; padding:4px 12px; border-radius:12px; font-weight:700; font-size:12px;'>⚪ Sin Saldos Declarados</span>"
-                        note = "El documento no cuenta con saldos de apertura y cierre explícitos en su texto o estructura XML para validar matemáticamente."
+                        status_badge = f"<span style='background-color:#c62828; color:white; padding:4px 12px; border-radius:12px; font-weight:700; font-size:12px;'>❌ RECHAZADO</span>"
+                        note = f"Discrepancia contable de ${diff_val:,.2f} o modo contable ambiguo. La conciliación aritmética falló."
 
                     s_ini_str = f"${r_res.saldo_inicial:,.2f}" if r_res.saldo_inicial is not None else "N/D"
                     s_fin_calc_str = f"${r_res.saldo_final_calculado:,.2f}" if r_res.saldo_final_calculado is not None else "N/D"
                     s_fin_esp_str = f"${s_fin_esp:,.2f}" if s_fin_esp is not None else "N/D"
                     diff_str = f"${diff_val:,.2f}"
-                    cuadra_text = "True ✅" if is_cuadra is True else ("False ❌" if is_cuadra is False else "N/D")
+                    cadena_str = f"{r_res.cumplimiento_cadena_saldo:.1f}%" if r_res.cumplimiento_cadena_saldo is not None else "N/D"
+                    cobertura_str = f"{cobertura_val * 100:.1f}%"
 
                     st.markdown(
                         f"""
                         <div style="background-color: {badge_bg}; border: 1px solid {border_color}; border-left: 6px solid {badge_color}; border-radius: 8px; padding: 14px 18px; margin: 12px 0;">
                             <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px;">
-                                <div style="font-weight: 700; font-size: 15px; color: #212121;">📄 {r_fname}</div>
+                                <div style="font-weight: 700; font-size: 15px; color: #212121;">📄 {r_fname} <span style="font-size:12px; color:#666; font-weight:normal;">[Modo: {modo_str}]</span></div>
                                 <div>{status_badge}</div>
                             </div>
-                            <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(130px, 1fr)); gap: 10px; font-size: 13px; color: #333; margin-bottom: 6px;">
+                            <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(120px, 1fr)); gap: 10px; font-size: 13px; color: #333; margin-bottom: 6px;">
                                 <div><small style="color: #666;">Saldo Inicial</small><br><b>{s_ini_str}</b></div>
                                 <div><small style="color: #666;">Abonos / Ingresos</small><br><b style="color: #2e7d32;">${abonos_val:,.2f}</b></div>
                                 <div><small style="color: #666;">Cargos / Egresos</small><br><b style="color: #c62828;">${cargos_val:,.2f}</b></div>
-                                <div><small style="color: #666;">Saldo Final Calculado</small><br><b>{s_fin_calc_str}</b></div>
-                                <div><small style="color: #666;">Saldo Final Esperado</small><br><b>{s_fin_esp_str}</b></div>
+                                <div><small style="color: #666;">Saldo Calculado</small><br><b>{s_fin_calc_str}</b></div>
+                                <div><small style="color: #666;">Saldo Esperado</small><br><b>{s_fin_esp_str}</b></div>
                                 <div><small style="color: #666;">Diferencia</small><br><b style="color: {badge_color};">{diff_str}</b></div>
-                                <div><small style="color: #666;">¿Cuadra?</small><br><b style="color: {badge_color};">{cuadra_text}</b></div>
+                                <div><small style="color: #666;">Cobertura</small><br><b>{cobertura_str}</b></div>
+                                <div><small style="color: #666;">Cadena Renglón</small><br><b>{cadena_str}</b></div>
                             </div>
                             <div style="font-size: 12px; color: #616161; margin-top: 4px;"><i>{note}</i></div>
                         </div>
                         """,
                         unsafe_allow_html=True
                     )
+
+                    # Show audit breakdown of rejected rows if present
+                    if rechazadas:
+                        with st.expander(f"⚠️ Ver {len(rechazadas)} Filas Rechazadas en {r_fname}", expanded=False):
+                            st.caption("Filas que no superaron la validación de esquema, tenían importe <= 0 o fecha inválida:")
+                            df_rech = pd.DataFrame(rechazadas)
+                            cols_to_show = [c for c in ["linea_origen", "motivo", "detalle_error"] if c in df_rech.columns]
+                            st.dataframe(df_rech[cols_to_show], width="stretch")
+
                 st.write("")
+
+            # Export Warning if any unverified document is present in the current batch
+            if has_unverified:
+                st.warning(
+                    "⚠️ **Advertencia Contable:** Uno o más estados de cuenta no alcanzaron el estado **VERIFICADO** "
+                    "(discrepancia aritmética, cobertura incompleta o filas rechazadas). "
+                    "Se recomienda verificar el origen de las inconsistencias antes de utilizar los datos contables."
+                )
 
             # Global Excel Download button
             excel_bytes = df_to_excel_bytes(df_ingresos, df_egresos)
@@ -1258,10 +1428,18 @@ def main():
 
             st.write("")
 
-            tab_egresos, tab_ingresos, tab_todos = st.tabs([
+            # Review queue items
+            df_dudosas = df_all[df_all["estado_revision"].isin(["REVISAR", "DISCREPANCIA_OCR"])].copy() if not df_all.empty and "estado_revision" in df_all.columns else pd.DataFrame()
+            all_rechazadas = []
+            for r_info in reconciliation_reports.values():
+                all_rechazadas.extend(r_info.get("filas_rechazadas", []))
+            count_revision = len(df_dudosas) + len(all_rechazadas)
+
+            tab_egresos, tab_ingresos, tab_todos, tab_revision = st.tabs([
                 f"💸 Egresos / Gastos ({len(df_egresos)})",
                 f"💰 Ingresos / Abonos ({len(df_ingresos)})",
-                f"📊 Todos los Movimientos ({len(df_all)})"
+                f"📊 Todos los Movimientos ({len(df_all)})",
+                f"⚠️ Cola de Revisión ({count_revision})"
             ])
 
             with tab_egresos:
@@ -1357,6 +1535,64 @@ def main():
                         },
                         hide_index=True
                     )
+
+            with tab_revision:
+                st.markdown("### ⚠️ Cola de Revisión Contable y Arbitraje")
+                st.caption(
+                    "Filas que requieren confirmación manual: confianza < 0.75, celdas desplazadas, "
+                    "discrepancias entre pasadas de OCR o errores de esquema rechazados."
+                )
+
+                if df_dudosas.empty and not all_rechazadas:
+                    st.success("✨ ¡No hay filas pendientes de revisión! Todas las transacciones tienen confianza >= 0.75 y cadena de saldo válida.")
+                else:
+                    if not df_dudosas.empty:
+                        st.markdown(f"##### 📝 Transacciones Marcadas para Revisión ({len(df_dudosas)} movimientos)")
+                        cols_dudosas = [c for c in ["id", "pagina", "fecha", "concepto", "importe", "tipo", "saldo_renglon", "confianza", "estado_revision", "linea_origen"] if c in df_dudosas.columns]
+                        edited_rev = st.data_editor(
+                            df_dudosas[cols_dudosas],
+                            disabled=[c for c in cols_dudosas if c not in ("tipo", "importe")],
+                            column_config={
+                                "tipo": st.column_config.SelectboxColumn(
+                                    "Tipo de Flujo",
+                                    options=["ingreso", "egreso"],
+                                    required=True
+                                ),
+                                "importe": st.column_config.NumberColumn(
+                                    "Importe ($)",
+                                    min_value=0.01,
+                                    format="$%.2f"
+                                )
+                            },
+                            key="editor_cola_revision",
+                            width="stretch"
+                        )
+
+                        col_btn1, col_btn2 = st.columns([1, 1])
+                        with col_btn1:
+                            if st.button("💾 Aplicar Correcciones y Recalcular Conciliación", key="btn_apply_corrections", type="primary"):
+                                # Apply edits back to transactions
+                                for idx_row, row in edited_rev.iterrows():
+                                    row_id = row.get("id")
+                                    new_tipo = row.get("tipo")
+                                    new_imp = row.get("importe")
+                                    for t in transactions:
+                                        if getattr(t, "id", None) == row_id or (getattr(t, "fecha", "") == row.get("fecha") and getattr(t, "concepto", "") == row.get("concepto")):
+                                            t.tipo = TipoTransaccion(new_tipo) if isinstance(new_tipo, str) else new_tipo
+                                            t.importe = float(new_imp)
+                                            t.estado_revision = "VERIFICADO"
+                                            t.confianza = 1.0
+                                st.session_state["all_transactions"] = transactions
+                                st.success("✅ ¡Correcciones aplicadas! Las transacciones fueron promovidas a VERIFICADO.")
+                                st.rerun()
+
+                    if all_rechazadas:
+                        st.write("")
+                        st.markdown(f"##### 🚫 Filas Rechazadas en este Lote ({len(all_rechazadas)} filas)")
+                        st.caption("Renglones que no superaron el filtro de candidatos o formato monetario:")
+                        df_rech_q = pd.DataFrame(all_rechazadas)
+                        show_rech_cols = [c for c in ["pagina", "linea_origen", "motivo", "detalle_error"] if c in df_rech_q.columns]
+                        st.dataframe(df_rech_q[show_rech_cols], width="stretch", hide_index=True)
         elif not uploaded_files:
             st.info("👆 Carga uno o más archivos de estado de cuenta (.pdf o .xml) y presiona **Procesar Estados de Cuenta** para comenzar.")
 

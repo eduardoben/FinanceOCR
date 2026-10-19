@@ -1,0 +1,57 @@
+{
+  "case_id": "case_03_santander_fechas_sin_anio_oxxo_gemelas",
+  "banco": "Banco Santander México",
+  "tipo_documento": "pdf_digital",
+  "modo_esperado": "debito",
+  "saldo_inicial": 8000.0,
+  "saldo_final": 12750.0,
+  "total_cargos": 5250.0,
+  "total_abonos": 10000.0,
+  "movimientos_esperados": [
+    {
+      "fecha": "2023-12-18",
+      "concepto": "DEPOSITO AGUINALDO",
+      "importe": 10000.0,
+      "descripcion": "DEPOSITO AGUINALDO",
+      "tipo": "ingreso",
+      "saldo_renglon": 18000.0,
+      "pagina": 1
+    },
+    {
+      "fecha": "2023-12-24",
+      "concepto": "COMPRA LIVERPOOL DEPARTAMENTAL",
+      "importe": 4500.0,
+      "descripcion": "COMPRA LIVERPOOL DEPARTAMENTAL",
+      "tipo": "egreso",
+      "saldo_renglon": 13500.0,
+      "pagina": 1
+    },
+    {
+      "fecha": "2024-01-05",
+      "concepto": "CADENA COMERCIAL OXXO SUCURSAL CENTRO",
+      "importe": 125.0,
+      "descripcion": "CADENA COMERCIAL OXXO SUCURSAL CENTRO",
+      "tipo": "egreso",
+      "saldo_renglon": 13375.0,
+      "pagina": 1
+    },
+    {
+      "fecha": "2024-01-05",
+      "concepto": "CADENA COMERCIAL OXXO SUCURSAL CENTRO",
+      "importe": 125.0,
+      "descripcion": "CADENA COMERCIAL OXXO SUCURSAL CENTRO",
+      "tipo": "egreso",
+      "saldo_renglon": 13250.0,
+      "pagina": 1
+    },
+    {
+      "fecha": "2024-01-10",
+      "concepto": "PAGO PLAN TELCEL",
+      "importe": 500.0,
+      "descripcion": "PAGO PLAN TELCEL",
+      "tipo": "egreso",
+      "saldo_renglon": 12750.0,
+      "pagina": 1
+    }
+  ]
+}

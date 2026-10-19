@@ -18,8 +18,8 @@ from PIL import Image
 from lxml import etree
 import pypdfium2 as pdfium
 
-from models import Transaccion, TipoTransaccion
-from date_utils import normalize_spanish_date
+from models import Transaccion, TipoTransaccion, sanitize_importe, compute_row_confidence
+from date_utils import normalize_spanish_date, extract_statement_year, extract_statement_period
 
 # Docling imports
 from docling.document_converter import DocumentConverter, PdfFormatOption
@@ -309,10 +309,34 @@ def parse_pdf(
 import re
 
 DATE_PATTERN = re.compile(
-    r"\b(?:\d{1,2}[-/\s](?:ene|feb|mar|abr|may|jun|jul|ago|sep|oct|nov|dic|[a-z]{3}|\d{1,2})[-/\s]\d{2,4}|\d{4}[-/\s]\d{1,2}[-/\s]\d{1,2}|\d{8})\b",
+    r"\b(?:"
+    r"\d{4}[-/\s]\d{1,2}[-/\s]\d{1,2}"  # YYYY-MM-DD
+    r"|\d{1,2}[-/\s](?:ene|feb|mar|abr|may|jun|jul|ago|sep|oct|nov|dic|[a-z]{3})(?:[-/\s]\d{2,4})?"  # 15 ENE, 15/ENE, 15-ENE, 15/ENE/2024
+    r"|\d{1,2}[-/\s]\d{1,2}[-/\s]\d{2,4}"  # 15/01/2024, 15-01-24
+    r"|\d{1,2}[-/]\d{1,2}"  # 15/01, 15-01
+    r"|\d{8}"  # 20240115
+    r")\b",
     re.IGNORECASE
 )
 MONEY_PATTERN = re.compile(r"(?:\$\s*[\d,]+\.\d{2}|[\d,]+\.\d{2})")
+
+
+def is_candidate_row(line: str) -> bool:
+    """
+    Evaluates whether a text or table row is a candidate financial transaction row.
+    """
+    stripped = line.strip()
+    return bool(DATE_PATTERN.search(stripped) and MONEY_PATTERN.search(stripped))
+
+
+def evaluar_linea_candidata(line: str) -> Dict[str, Any]:
+    """
+    Returns candidate status evaluation dictionary: {"candidata": bool, "linea": str}
+    """
+    return {
+        "candidata": is_candidate_row(line),
+        "linea": line
+    }
 
 
 def parse_xml(file_path: str, user_rfc: Optional[str] = None) -> Tuple[Optional[List[Transaccion]], Optional[str]]:
@@ -1192,71 +1216,823 @@ def resolve_xml_strategy(
         }
 
 
+_BAL_AMT_REGEX = r"(?:\(\s*[-−–]?\s*\$?\s*[\d,]+\.\d{2}\s*(?:MXN|USD)?\s*\)|[-−–]?\s*\$?\s*[\d,]+\.\d{2}\s*[-−–]?(?:\s*(?:CR|DR|DB|MXN|USD))?)"
+
+
+def _extract_balance_amount(label_pattern: str, text: str) -> Optional[float]:
+    """
+    Matches label_pattern followed optionally by multiline separator and monetary amount.
+    Supports negative formats: -1,500.00, (1,500.00), 1,500.00-, 1,500.00 DR/DB/CR.
+    """
+    pattern = (
+        r"(?i)(?:" + label_pattern + r")"
+        r"(?:[:\s\t\|]|\*\*|-(?![\$\d\s]))*(?:\r?\n)?[\s\t\|:]*"
+        r"(" + _BAL_AMT_REGEX + r")"
+    )
+    m = re.search(pattern, text)
+    if m:
+        raw_val = m.group(1).strip()
+        return sanitize_importe(raw_val, keep_sign=True)
+    return None
+
+
 def extract_statement_balances(text: str) -> Dict[str, Optional[float]]:
     """
     Deterministically extracts opening (saldo_inicial) and closing (saldo_final)
     balances from document text, markdown tables, or XML representations.
 
+    Supports:
+    - Overdraft negative balances: -1,500.00, (1,500.00), 1,500.00-, DR, DB, CR.
+    - Multiline extraction where amount appears on subsequent line (Saldo Inicial\n$1,500.00).
+    - Credit card statement patterns: 'Saldo deudor total', 'Saldo anterior', 'Nuevo saldo',
+      'Total cargos', 'Total abonos'.
+
     Args:
         text: Raw document text, markdown content, or XML string.
 
     Returns:
-        Dict[str, Optional[float]]: Dictionary containing 'saldo_inicial' and 'saldo_final'.
+        Dict[str, Optional[float]]: Dictionary containing extracted balances and summary totals.
     """
     balances: Dict[str, Optional[float]] = {
         "saldo_inicial": None,
-        "saldo_final": None
+        "saldo_final": None,
+        "saldo_anterior": None,
+        "saldo_deudor_total": None,
+        "nuevo_saldo": None,
+        "total_cargos": None,
+        "total_abonos": None,
     }
     if not text or not isinstance(text, str):
         return balances
 
     # 1. XML attribute checks (e.g. ecb:EstadoDeCuentaBancario or OFX LEDGERBAL)
-    ecb_ini = re.search(r"""(?:saldoInicial|saldoAnterior)\s*=\s*["']\s*([-\d,]+\.\d{2})["']""", text, re.I)
+    ecb_ini = re.search(r"""(?:saldoInicial|saldoAnterior)\s*=\s*["']\s*([-\d,]+\.\d{2}[^"']*)["']""", text, re.I)
     if ecb_ini:
         try:
-            balances["saldo_inicial"] = float(ecb_ini.group(1).replace(",", ""))
-        except ValueError:
+            balances["saldo_inicial"] = sanitize_importe(ecb_ini.group(1), keep_sign=True)
+            balances["saldo_anterior"] = balances["saldo_inicial"]
+        except Exception:
             pass
 
-    ecb_fin = re.search(r"""(?:saldoFinal|saldoAlCorte)\s*=\s*["']\s*([-\d,]+\.\d{2})["']""", text, re.I)
+    ecb_fin = re.search(r"""(?:saldoFinal|saldoAlCorte)\s*=\s*["']\s*([-\d,]+\.\d{2}[^"']*)["']""", text, re.I)
     if ecb_fin:
         try:
-            balances["saldo_final"] = float(ecb_fin.group(1).replace(",", ""))
-        except ValueError:
+            balances["saldo_final"] = sanitize_importe(ecb_fin.group(1), keep_sign=True)
+        except Exception:
             pass
 
     ofx_bal = re.search(r"""<LEDGERBAL>[\s\S]*?<BALAMT>\s*([-\d,]+\.\d{2})""", text, re.I)
     if ofx_bal and balances["saldo_final"] is None:
         try:
-            balances["saldo_final"] = float(ofx_bal.group(1).replace(",", ""))
-        except ValueError:
+            balances["saldo_final"] = sanitize_importe(ofx_bal.group(1), keep_sign=True)
+        except Exception:
             pass
 
-    # 2. Text / Markdown patterns for Spanish bank statements
-    if balances["saldo_inicial"] is None:
-        ini_m = re.search(
-            r"(?:saldo\s+anterior|saldo\s+inicial|saldo\s+al\s+inicio)[^\d\n\$]{0,40}\$?\s*([\d,]+\.\d{2})",
-            text,
-            re.I
-        )
-        if ini_m:
-            try:
-                balances["saldo_inicial"] = float(ini_m.group(1).replace(",", ""))
-            except ValueError:
-                pass
+    # 2. Extract specific credit card and banking labels (single or multi-line)
+    saldo_anterior = _extract_balance_amount(r"saldo\s+(?:deudor\s+)?anterior(?:\s+al\s+corte)?", text)
+    saldo_inicial = _extract_balance_amount(r"saldo\s+inicial(?:\s+del\s+periodo)?|saldo\s+al\s+inicio", text)
+    saldo_actual = _extract_balance_amount(r"saldo\s+actual(?:\s+al\s+corte)?|saldo\s+final(?:\s+al\s+corte)?|saldo\s+al\s+corte", text)
+    nuevo_saldo = _extract_balance_amount(r"nuevo\s+saldo(?:\s+al\s+corte)?", text)
+    saldo_deudor_total = _extract_balance_amount(r"saldo\s+deudor\s+total|saldo\s+deudor(?:\s+total)?", text)
+    total_cargos = _extract_balance_amount(
+        r"total\s+(?:de\s+)?cargos?|total\s+(?:de\s+)?retiros?(?:\s*/\s*cargos)?|compras\s+y\s+disposiciones", text
+    )
+    total_abonos = _extract_balance_amount(
+        r"total\s+(?:de\s+)?abonos?|total\s+(?:de\s+)?dep[oó]sitos?(?:\s*/\s*abonos)?|pagos\s+y\s+cr[eé]ditos", text
+    )
 
+    balances["saldo_anterior"] = saldo_anterior
+    balances["saldo_deudor_total"] = saldo_deudor_total
+    balances["nuevo_saldo"] = nuevo_saldo
+    balances["total_cargos"] = total_cargos
+    balances["total_abonos"] = total_abonos
+
+    # Determine primary saldo_inicial
+    if balances["saldo_inicial"] is None:
+        balances["saldo_inicial"] = saldo_inicial if saldo_inicial is not None else saldo_anterior
+
+    # Determine primary saldo_final
     if balances["saldo_final"] is None:
-        fin_m = re.search(
-            r"(?:saldo\s+actual|saldo\s+final|nuevo\s+saldo|saldo\s+al\s+corte)[^\d\n\$]{0,40}\$?\s*([\d,]+\.\d{2})",
-            text,
-            re.I
-        )
-        if fin_m:
-            try:
-                balances["saldo_final"] = float(fin_m.group(1).replace(",", ""))
-            except ValueError:
-                pass
+        if saldo_actual is not None:
+            balances["saldo_final"] = saldo_actual
+        elif nuevo_saldo is not None:
+            balances["saldo_final"] = nuevo_saldo
+        elif saldo_deudor_total is not None:
+            balances["saldo_final"] = saldo_deudor_total
 
     return balances
+
+
+def infer_statement_mode(
+    text: str,
+    summary_data: Optional[Dict[str, Any]] = None
+) -> str:
+    """
+    Infiere determinísticamente el modo contable del estado de cuenta:
+    'debito', 'credito', o 'ambiguo'.
+
+    Señales explícitas de Crédito:
+    - límite de crédito / crédito disponible / línea de crédito
+    - pago para no generar intereses / pago mínimo
+    - saldo deudor / saldo deudor total / nuevo saldo (tarjeta)
+    - tarjeta de crédito / pago tarjeta / compras y disposiciones
+
+    Señales explícitas de Débito:
+    - cuenta de cheques / cuenta de débito
+    - clabe / clabe interbancaria
+    - saldo promedio / saldo disponible (bancario)
+    - depósito nómina / retiro cajero
+
+    Cruce matemático contra summary_data (totales declarados):
+    - Verifica si saldo_inicial + total_abonos - total_cargos == saldo_final (débito)
+    - o saldo_inicial - total_abonos + total_cargos == saldo_final (crédito)
+    """
+    raw_text = (text or "").lower()
+    sum_data = summary_data or {}
+
+    # 1. Indicadores textuales de crédito
+    credit_indicators = [
+        "límite de crédito", "limite de credito", "crédito disponible", "credito disponible",
+        "línea de crédito", "linea de credito",
+        "pago para no generar intereses", "pago minimo", "pago mínimo",
+        "saldo deudor total", "saldo deudor", "tarjeta de crédito", "tarjeta de credito",
+        "tarjeta", "pago tarjeta", "compras y disposiciones"
+    ]
+    credit_score = sum(1 for ind in credit_indicators if ind in raw_text)
+
+    # 2. Indicadores textuales de débito
+    debit_indicators = [
+        "cuenta de cheques", "cuenta cheques", "cuenta de débito", "cuenta de debito",
+        "clabe", "clabe interbancaria", "saldo promedio", "saldo disponible",
+        "depósito nómina", "deposito nomina", "retiro en cajero", "retiro cajero", "cajero automático"
+    ]
+    debit_score = sum(1 for ind in debit_indicators if ind in raw_text)
+
+    # 3. Cruce matemático contra totales declarados en el resumen del estado de cuenta
+    s_ini = sum_data.get("saldo_inicial") if sum_data.get("saldo_inicial") is not None else sum_data.get("saldo_anterior")
+    s_fin = sum_data.get("saldo_final") if sum_data.get("saldo_final") is not None else (
+        sum_data.get("nuevo_saldo") or sum_data.get("saldo_deudor_total") or sum_data.get("saldo_actual")
+    )
+    t_cargos = sum_data.get("total_cargos")
+    t_abonos = sum_data.get("total_abonos")
+
+    math_mode = None
+    if s_ini is not None and s_fin is not None and t_cargos is not None and t_abonos is not None:
+        deb_calc = round(float(s_ini) + float(t_abonos) - float(t_cargos), 2)
+        cred_calc = round(float(s_ini) - float(t_abonos) + float(t_cargos), 2)
+        target = round(float(s_fin), 2)
+
+        match_deb = abs(deb_calc - target) <= 0.05
+        match_cred = abs(cred_calc - target) <= 0.05
+
+        if match_deb and not match_cred:
+            math_mode = "debito"
+        elif match_cred and not match_deb:
+            math_mode = "credito"
+
+    # Resolución combinada
+    if math_mode == "debito" and credit_score == 0:
+        return "debito"
+    if math_mode == "credito" and debit_score == 0:
+        return "credito"
+    if math_mode and math_mode == ("credito" if credit_score > debit_score else "debito"):
+        return math_mode
+
+    if credit_score > 0 and debit_score == 0:
+        return "credito"
+    if debit_score > 0 and credit_score == 0:
+        return "debito"
+
+    if math_mode:
+        return math_mode
+
+    return "ambiguo"
+
+
+def _clean_cell(cell: str) -> str:
+    """Cleans cell markdown formatting, bold/italics markers, and leading/trailing whitespace."""
+    return cell.replace("**", "").replace("__", "").replace("\\|", "|").strip()
+
+
+def _identify_table_columns(headers: List[str]) -> Dict[str, Optional[int]]:
+    """
+    Normaliza encabezados mediante expresiones regulares para mapear los índices de columna:
+    - col_fecha: fecha, f. oper, f. liq, dia, fechas
+    - col_descripcion: concepto, descripcion, detalle, movimiento, leyenda
+    - col_cargo: cargo, cargos, retiro, retiros, disposicion, debito, salidas, egresos
+    - col_abono: abono, abonos, deposito, depositos, pago, pagos, credito, entradas, ingresos
+    - col_importe_unico: importe, monto, valor, cantidad
+    - col_saldo: saldo, balance, saldo disponible, saldo actual
+    - col_referencia: referencia, folio, autorizacion, rastreo, aut, ref
+    """
+    mapping: Dict[str, Optional[int]] = {
+        "fecha": None,
+        "descripcion": None,
+        "cargo": None,
+        "abono": None,
+        "importe_unico": None,
+        "saldo": None,
+        "referencia": None,
+    }
+    for idx, raw_h in enumerate(headers):
+        h = _clean_cell(raw_h).lower()
+        if not h:
+            continue
+        # Check saldo first to avoid 'saldo deudor' matching cargo
+        if re.search(r"\b(?:saldo|balance)\b", h):
+            if mapping["saldo"] is None:
+                mapping["saldo"] = idx
+        elif re.search(r"\b(?:cargos?|retiros?|disposici[oó]n(?:es)?|d[eé]bitos?|salidas?|egresos?|compras?)\b", h):
+            if mapping["cargo"] is None:
+                mapping["cargo"] = idx
+        elif re.search(r"\b(?:abonos?|dep[oó]sitos?|pagos?|cr[eé]ditos?|entradas?|ingresos?)\b", h):
+            if mapping["abono"] is None:
+                mapping["abono"] = idx
+        elif re.search(r"\b(?:fechas?|f\.?\s*oper(?:aci[oó]n)?|f\.?\s*liq(?:uidaci[oó]n)?|d[ií]a|date)\b", h):
+            if mapping["fecha"] is None:
+                mapping["fecha"] = idx
+        elif re.search(r"\b(?:referencia|folio|autorizaci[oó]n|aut|rastreo|ref)\b", h):
+            if mapping["referencia"] is None:
+                mapping["referencia"] = idx
+        elif re.search(r"\b(?:concepto|descripci[oó]n|detalle|movimiento|leyenda|comercio|establecimiento|transacci[oó]n)\b", h):
+            if mapping["descripcion"] is None:
+                mapping["descripcion"] = idx
+        elif re.search(r"\b(?:importe|monto|valor|cantidad|amount)\b", h):
+            if mapping["importe_unico"] is None:
+                mapping["importe_unico"] = idx
+
+    # If both cargo and abono exist, single-amount column is not used
+    if mapping["cargo"] is not None and mapping["abono"] is not None:
+        mapping["importe_unico"] = None
+
+    return mapping
+
+
+def parse_docling_markdown_tables(
+    markdown_text: str,
+    modo_contable: str = "debito",
+    statement_period: Optional[Tuple[str, str]] = None,
+    default_page: int = 1
+) -> Tuple[List[Transaccion], List[str], Dict[str, Any]]:
+    """
+    Deterministic Markdown Table Parser for Docling outputs.
+    
+    Identifies Markdown table blocks, maps column indices, merges multiline
+    descriptions, determines transaction cashflow types, and detects shifted cells.
+    
+    Returns:
+        (transactions: List[Transaccion], unparsed_candidate_lines: List[str], meta: Dict[str, Any])
+    """
+    if not markdown_text or not isinstance(markdown_text, str):
+        return [], [], {"total_candidate_lines": 0, "captured_candidate_lines": 0, "unparsed_candidate_lines_count": 0, "table_transactions_count": 0, "tables_detected": 0}
+
+    statement_year = extract_statement_year(markdown_text)
+    effective_period = statement_period or extract_statement_period(markdown_text)
+    all_transactions: List[Transaccion] = []
+    captured_candidate_lines: set = set()
+
+    # Split into contiguous blocks of table lines and track page numbers
+    lines = markdown_text.splitlines()
+    table_blocks: List[Tuple[int, List[str]]] = []
+    current_block: List[str] = []
+    current_page = default_page
+
+    for line in lines:
+        s_line = line.strip()
+        p_match = re.search(r"(?:<!--\s*page(?:_no)?:\s*(\d+)\s*-->|<!--\s*page\s+(\d+)\s*-->|^#+\s*P[aá]gina\s+(\d+)|<!--\s*Page\s+(\d+)\s*-->)", s_line, re.I)
+        if p_match:
+            current_page = int(next(g for g in p_match.groups() if g is not None))
+
+        if "|" in s_line and s_line.startswith("|") and s_line.endswith("|"):
+            current_block.append(s_line)
+        else:
+            if current_block:
+                table_blocks.append((current_page, current_block))
+                current_block = []
+    if current_block:
+        table_blocks.append((current_page, current_block))
+
+    for block_page, block in table_blocks:
+        if len(block) < 3:
+            continue
+
+        # Find separator line
+        sep_idx = None
+        for i, l in enumerate(block):
+            if re.search(r"^\|\s*(?::?-{2,}:?\s*\|)+\s*$", l):
+                sep_idx = i
+                break
+
+        if sep_idx is None or sep_idx == 0:
+            continue
+
+        # Inspect headers: pick the row right before separator
+        header_row = block[sep_idx - 1]
+        raw_headers = [c for c in header_row.split("|")]
+        if len(raw_headers) >= 2 and raw_headers[0] == "":
+            raw_headers = raw_headers[1:]
+        if len(raw_headers) >= 1 and raw_headers[-1] == "":
+            raw_headers = raw_headers[:-1]
+
+        cols = _identify_table_columns(raw_headers)
+
+        # Check if table has a date column and at least one financial amount column
+        has_amt_col = (cols["cargo"] is not None) or (cols["abono"] is not None) or (cols["importe_unico"] is not None)
+        if cols["fecha"] is None or not has_amt_col:
+            continue
+
+        table_txs: List[Transaccion] = []
+        data_rows = block[sep_idx + 1 :]
+
+        for data_line in data_rows:
+            raw_cells = [c for c in data_line.split("|")]
+            if len(raw_cells) >= 2 and raw_cells[0] == "":
+                raw_cells = raw_cells[1:]
+            if len(raw_cells) >= 1 and raw_cells[-1] == "":
+                raw_cells = raw_cells[:-1]
+
+            if not raw_cells or all(not _clean_cell(c) for c in raw_cells):
+                continue
+
+            cleaned_cells = [_clean_cell(c) for c in raw_cells]
+
+            col_fecha = cols["fecha"]
+            col_desc = cols["descripcion"]
+            col_cargo = cols["cargo"]
+            col_abono = cols["abono"]
+            col_imp = cols["importe_unico"]
+            col_saldo = cols["saldo"]
+            col_ref = cols["referencia"]
+
+            fecha_raw = cleaned_cells[col_fecha] if col_fecha < len(cleaned_cells) else ""
+            cargo_raw = cleaned_cells[col_cargo] if col_cargo is not None and col_cargo < len(cleaned_cells) else ""
+            abono_raw = cleaned_cells[col_abono] if col_abono is not None and col_abono < len(cleaned_cells) else ""
+            imp_raw = cleaned_cells[col_imp] if col_imp is not None and col_imp < len(cleaned_cells) else ""
+            saldo_raw = cleaned_cells[col_saldo] if col_saldo is not None and col_saldo < len(cleaned_cells) else ""
+
+            has_date = bool(DATE_PATTERN.search(fecha_raw))
+            has_cargo = bool(MONEY_PATTERN.search(cargo_raw))
+            has_abono = bool(MONEY_PATTERN.search(abono_raw))
+            has_imp = bool(MONEY_PATTERN.search(imp_raw))
+            has_any_amt = has_cargo or has_abono or has_imp
+
+            # -------------------------------------------------------------
+            # FUSIÓN DE DESCRIPCIONES MULTILÍNEA
+            # -------------------------------------------------------------
+            if not has_date and not has_any_amt:
+                desc_text = cleaned_cells[col_desc] if col_desc is not None and col_desc < len(cleaned_cells) else ""
+                if not desc_text:
+                    desc_text = " ".join(c for c in cleaned_cells if c)
+                target_tx = table_txs[-1] if table_txs else (all_transactions[-1] if all_transactions else None)
+                if desc_text and target_tx:
+                    target_tx.descripcion = f"{target_tx.descripcion} {desc_text}".strip()
+                    target_tx.linea_origen = f"{target_tx.linea_origen}\n{data_line}".strip()
+                    captured_candidate_lines.add(data_line.strip())
+                continue
+
+            # -------------------------------------------------------------
+            # DETERMINACIÓN DE VALORES DE LA FILA
+            # -------------------------------------------------------------
+            if has_date:
+                norm_date = normalize_spanish_date(fecha_raw, default_year=statement_year, statement_period=effective_period)
+            else:
+                norm_date = table_txs[-1].fecha if table_txs else "2024-01-01"
+
+            desc_cell = cleaned_cells[col_desc] if col_desc is not None and col_desc < len(cleaned_cells) else ""
+            concepto = desc_cell.strip() or "Movimiento bancario"
+            descripcion = concepto
+
+            if col_ref is not None and col_ref < len(cleaned_cells):
+                ref_val = cleaned_cells[col_ref].strip()
+                if ref_val:
+                    descripcion += f" | Ref: {ref_val}"
+
+            saldo_renglon = sanitize_importe(saldo_raw, keep_sign=True) if bool(MONEY_PATTERN.search(saldo_raw)) else None
+            requiere_verificacion_llm = False
+            importe = 0.0
+            tipo = TipoTransaccion.EGRESO
+
+            # Separated Cargo and/or Abono columns
+            if col_cargo is not None or col_abono is not None:
+                c_val = sanitize_importe(cargo_raw) if (col_cargo is not None and has_cargo) else 0.0
+                a_val = sanitize_importe(abono_raw) if (col_abono is not None and has_abono) else 0.0
+
+                if c_val > 0.0 and a_val == 0.0:
+                    tipo = TipoTransaccion.EGRESO
+                    importe = c_val
+                elif a_val > 0.0 and c_val == 0.0:
+                    tipo = TipoTransaccion.INGRESO
+                    importe = a_val
+                elif c_val > 0.0 and a_val > 0.0:
+                    # Contradiction: both columns populated in same row
+                    requiere_verificacion_llm = True
+                    importe = max(c_val, a_val)
+                    tipo = TipoTransaccion.EGRESO
+                elif c_val == 0.0 and a_val == 0.0 and saldo_renglon is not None and saldo_renglon > 0.0:
+                    # Cell shift in Docling: amount landed in saldo column
+                    requiere_verificacion_llm = True
+                    importe = saldo_renglon
+                    saldo_renglon = None
+                    tipo = TipoTransaccion.EGRESO
+                else:
+                    if not has_any_amt:
+                        continue
+                    importe = 0.0
+
+            # Single amount column
+            elif col_imp is not None:
+                if not has_imp:
+                    continue
+                importe = sanitize_importe(imp_raw)
+                raw_s = imp_raw.strip()
+                is_neg = raw_s.startswith("-") or "(" in raw_s or raw_s.endswith("-") or "dr" in raw_s.lower() or "db" in raw_s.lower()
+                prev_s = table_txs[-1].saldo_renglon if table_txs and table_txs[-1].saldo_renglon is not None else None
+
+                if is_neg:
+                    tipo = TipoTransaccion.EGRESO if modo_contable == "debito" else TipoTransaccion.INGRESO
+                elif prev_s is not None and saldo_renglon is not None:
+                    diff_s = round(saldo_renglon - prev_s, 2)
+                    if modo_contable == "debito":
+                        tipo = TipoTransaccion.INGRESO if diff_s > 0 else TipoTransaccion.EGRESO
+                    else:
+                        tipo = TipoTransaccion.INGRESO if diff_s < 0 else TipoTransaccion.EGRESO
+                else:
+                    if EXPENSE_REGEX.search(concepto.upper()):
+                        tipo = TipoTransaccion.EGRESO
+                    elif INCOME_REGEX.search(concepto.upper()):
+                        tipo = TipoTransaccion.INGRESO
+                    else:
+                        tipo = TipoTransaccion.EGRESO
+
+            if importe <= 0.0:
+                continue
+
+            tx = Transaccion(
+                fecha=norm_date,
+                concepto=concepto,
+                importe=importe,
+                descripcion=descripcion,
+                tipo=tipo,
+                confianza=0.50 if requiere_verificacion_llm else 0.85,
+                origen="determinista_tabla",
+                linea_origen=data_line,
+                saldo_renglon=saldo_renglon,
+                estado_revision="REVISAR" if requiere_verificacion_llm else "VERIFICADO",
+                requiere_verificacion_llm=requiere_verificacion_llm,
+                pagina=block_page
+            )
+            table_txs.append(tx)
+            captured_candidate_lines.add(data_line.strip())
+
+        all_transactions.extend(table_txs)
+
+    # Calculate unparsed candidate lines outside detected tables
+    unparsed_lines = [
+        line for line in markdown_text.splitlines()
+        if is_candidate_row(line) and line.strip() not in captured_candidate_lines
+    ]
+
+    total_candidates = sum(1 for line in markdown_text.splitlines() if is_candidate_row(line))
+    meta = {
+        "total_candidate_lines": total_candidates,
+        "captured_candidate_lines": len(captured_candidate_lines),
+        "unparsed_candidate_lines_count": len(unparsed_lines),
+        "table_transactions_count": len(all_transactions),
+        "tables_detected": len(table_blocks),
+    }
+
+    return all_transactions, unparsed_lines, meta
+
+
+def validate_running_balance_chain(
+    transacciones: List[Transaccion],
+    saldo_inicial: Optional[float] = None,
+    modo_contable: str = "debito",
+    tolerance: float = 0.01,
+    statement_period: Optional[Tuple[str, str]] = None
+) -> Tuple[List[Transaccion], Dict[str, Any]]:
+    """
+    Valida aritméticamente la cadena secuencial de saldo renglón por renglón.
+    Detecta celdas desplazadas (donde un cargo fue asignado a abono o viceversa)
+    y ajusta automáticamente el tipo si la polaridad opuesta hace cuadrar exactamente el saldo.
+    Calcula el puntaje de confianza por fila mediante compute_row_confidence.
+
+    Returns:
+        Tuple[List[Transaccion], Dict[str, Any]]: Transacciones con confianza/auditoría y métricas.
+    """
+    if not transacciones:
+        return [], {
+            "filas_con_saldo": 0,
+            "filas_cumplen_cadena": 0,
+            "cumplimiento_cadena_saldo": None,
+            "filas_corregidas": 0,
+        }
+
+    current_balance = saldo_inicial
+    if current_balance is None:
+        for first_tx in transacciones:
+            if first_tx.saldo_renglon is not None:
+                is_ing = first_tx.tipo == TipoTransaccion.INGRESO
+                if modo_contable == "debito":
+                    current_balance = round(
+                        first_tx.saldo_renglon - first_tx.importe if is_ing else first_tx.saldo_renglon + first_tx.importe,
+                        2
+                    )
+                else:
+                    current_balance = round(
+                        first_tx.saldo_renglon + first_tx.importe if is_ing else first_tx.saldo_renglon - first_tx.importe,
+                        2
+                    )
+                break
+
+    filas_con_saldo = 0
+    filas_cumplen = 0
+    filas_corregidas = 0
+
+    for tx in transacciones:
+        row_saldo = tx.saldo_renglon
+        imp = tx.importe
+        is_ingreso = tx.tipo == TipoTransaccion.INGRESO
+
+        cadena_ok: Optional[bool] = None
+
+        was_shifted = False
+        if row_saldo is not None and current_balance is not None:
+            filas_con_saldo += 1
+            if modo_contable == "debito":
+                expected = round(current_balance + imp if is_ingreso else current_balance - imp, 2)
+            else:
+                expected = round(current_balance - imp if is_ingreso else current_balance + imp, 2)
+
+            if abs(round(expected - row_saldo, 2)) <= tolerance:
+                cadena_ok = True
+                filas_cumplen += 1
+                current_balance = row_saldo
+            else:
+                # Test opposite polarity (Shifted cell between cargo and abono)
+                if modo_contable == "debito":
+                    opp_expected = round(current_balance - imp if is_ingreso else current_balance + imp, 2)
+                else:
+                    opp_expected = round(current_balance + imp if is_ingreso else current_balance - imp, 2)
+
+                if abs(round(opp_expected - row_saldo, 2)) <= tolerance:
+                    # Cell shifted! Correct tipo
+                    tx.tipo = TipoTransaccion.EGRESO if is_ingreso else TipoTransaccion.INGRESO
+                    tx.descripcion = f"{tx.descripcion} [Ajuste: tipo invertido por saldo renglón]".strip()
+                    cadena_ok = True
+                    filas_cumplen += 1
+                    filas_corregidas += 1
+                    current_balance = row_saldo
+                    was_shifted = True
+                else:
+                    # Broken running balance chain
+                    cadena_ok = False
+                    tx.estado_revision = "REVISAR"
+                    current_balance = row_saldo
+        elif current_balance is not None:
+            # Row without saldo_renglon; progress balance according to transaction amount
+            if modo_contable == "debito":
+                current_balance = round(current_balance + imp if is_ingreso else current_balance - imp, 2)
+            else:
+                current_balance = round(current_balance - imp if is_ingreso else current_balance + imp, 2)
+
+        # Check signal agreement
+        acuerdo_senales = True
+        upper_text = f"{tx.concepto} {tx.descripcion}".upper()
+        if tx.tipo == TipoTransaccion.INGRESO and EXPENSE_REGEX.search(upper_text) and not INCOME_REGEX.search(upper_text):
+            acuerdo_senales = False
+        elif tx.tipo == TipoTransaccion.EGRESO and INCOME_REGEX.search(upper_text) and not EXPENSE_REGEX.search(upper_text):
+            acuerdo_senales = False
+
+        # Check statement period
+        fecha_en_periodo = True
+        if statement_period and len(statement_period) == 2:
+            p_start, p_end = statement_period
+            if p_start and p_end and (tx.fecha < p_start or tx.fecha > p_end):
+                fecha_en_periodo = False
+
+        # Compute confidence score
+        compute_row_confidence(
+            tx,
+            cadena_ok=cadena_ok,
+            acuerdo_senales=acuerdo_senales,
+            fecha_en_periodo=fecha_en_periodo
+        )
+
+        if was_shifted:
+            tx.estado_revision = "REVISAR"
+
+    cumplimiento = (
+        round((filas_cumplen / filas_con_saldo) * 100, 2)
+        if filas_con_saldo > 0
+        else None
+    )
+
+    metrics = {
+        "filas_con_saldo": filas_con_saldo,
+        "filas_cumplen_cadena": filas_cumplen,
+        "cumplimiento_cadena_saldo": cumplimiento,
+        "filas_corregidas": filas_corregidas
+    }
+    return transacciones, metrics
+
+
+def identify_low_confidence_pages(
+    transacciones: List[Transaccion],
+    filas_rechazadas: Optional[List[Dict[str, Any]]] = None,
+    cobertura: float = 1.0,
+    modo_contable: str = "debito",
+    tolerance: float = 0.01
+) -> List[int]:
+    """
+    Identifica las páginas candidatas a re-extracción selectiva en alta resolución.
+    Devuelve la lista ordenada y sin duplicados de páginas que cumplan cualquiera de estas condiciones:
+      - Contienen al menos una fila con confianza < 0.75 o estado_revision == 'REVISAR' / 'DISCREPANCIA_OCR'.
+      - Presentan una ruptura en la cadena de saldo (saldo_prev +- importe != saldo_renglon).
+      - Tienen entradas asociadas en filas_rechazadas o una cobertura de página < 0.99.
+    """
+    if not transacciones and not filas_rechazadas:
+        return []
+
+    low_conf_pages: set[int] = set()
+
+    # 1. Row confidence, review status, and running balance chain rupture
+    current_balance: Optional[float] = None
+    for tx in transacciones:
+        p = getattr(tx, "pagina", 1)
+        conf = getattr(tx, "confianza", 1.0)
+        st = getattr(tx, "estado_revision", "VERIFICADO")
+
+        if conf < 0.75 or st in ("REVISAR", "DISCREPANCIA_OCR"):
+            low_conf_pages.add(p)
+
+        # Check balance chain continuity
+        row_saldo = getattr(tx, "saldo_renglon", None)
+        if row_saldo is not None:
+            if current_balance is not None:
+                is_ingreso = tx.tipo == TipoTransaccion.INGRESO or str(tx.tipo).lower() in ("ingreso", "abono")
+                if modo_contable == "debito":
+                    expected = round(current_balance + tx.importe if is_ingreso else current_balance - tx.importe, 2)
+                else:
+                    expected = round(current_balance - tx.importe if is_ingreso else current_balance + tx.importe, 2)
+
+                if abs(round(expected - row_saldo, 2)) > tolerance:
+                    low_conf_pages.add(p)
+            current_balance = row_saldo
+
+    # 2. Inspect rejected rows associated with pages
+    if filas_rechazadas:
+        for r in filas_rechazadas:
+            if isinstance(r, dict) and "pagina" in r and r["pagina"] is not None:
+                try:
+                    low_conf_pages.add(int(r["pagina"]))
+                except Exception:
+                    pass
+
+    # 3. Overall coverage < 0.99 fallback
+    if cobertura < 0.99:
+        for tx in transacciones:
+            low_conf_pages.add(getattr(tx, "pagina", 1))
+
+    return sorted(list(low_conf_pages))
+
+
+def reextract_pages_high_res(
+    pdf_path: str,
+    page_numbers: List[int]
+) -> Dict[int, str]:
+    """
+    Re-extracción selectiva en modo ACCURATE de Docling para páginas dudosas.
+    Configura una instancia secundaria cacheada como singleton con TableFormerMode.ACCURATE,
+    images_scale=3.0 y OCR de página completa forzado.
+    Procesa exclusivamente los page_numbers solicitados y registra la métrica
+    'high_res_verification_pass' en telemetry.py.
+    """
+    if not page_numbers or not os.path.exists(pdf_path):
+        return {}
+
+    start_time = time.time()
+    try:
+        import psutil
+        proc = psutil.Process()
+        mem_before = proc.memory_info().rss / (1024 * 1024)
+    except Exception:
+        mem_before = 0.0
+
+    converter = get_cached_converter(
+        enable_ocr=True,
+        accurate_tables=True,
+        ocr_scale=3.0
+    )
+
+    result_pages: Dict[int, str] = {}
+    for p in sorted(set(page_numbers)):
+        try:
+            res = converter.convert(pdf_path, page_range=(p, p))
+            result_pages[p] = res.document.export_to_markdown()
+        except Exception as e:
+            result_pages[p] = f"<!-- Error re-extracting page {p}: {str(e)} -->"
+
+    elapsed = round(time.time() - start_time, 2)
+    try:
+        mem_after = proc.memory_info().rss / (1024 * 1024)
+        mem_used = max(0.0, mem_after - mem_before)
+    except Exception:
+        mem_used = 0.0
+
+    from telemetry import record_high_res_verification
+    record_high_res_verification(
+        elapsed_seconds=elapsed,
+        memory_mb=mem_used,
+        pages_count=len(page_numbers)
+    )
+
+    return result_pages
+
+
+def reconcile_extraction_passes(
+    pass1_rows: List[Transaccion],
+    pass2_rows: List[Transaccion],
+    saldo_anterior_pagina: Optional[float] = None,
+    modo_contable: str = "debito",
+    tolerance: float = 0.01
+) -> Tuple[List[Transaccion], Dict[str, Any]]:
+    """
+    Reconcilia y arbitra los resultados de extracción entre la Pasada 1 (FAST) y la Pasada 2 (ACCURATE).
+
+    - Si la Pasada 2 logra que la cadena de saldo cuadre (diferencia <= tolerance),
+      reemplaza las filas de la Pasada 1 en esa página, actualiza origen = 'verificado_multipass',
+      recalcula confianza y cambia estado_revision = 'VERIFICADO'.
+    - Si ambas pasadas difieren en importe, fecha o tipo y ninguna logra cuadrar la cadena de saldo,
+      conserva ambas versiones en los metadatos de auditoría y marca la fila con
+      estado_revision = 'DISCREPANCIA_OCR' y confianza = min(confianza, 0.40).
+    """
+    if not pass2_rows:
+        return pass1_rows, {"status": "pass1_retained", "cadena_ok": False}
+
+    # Evaluate pass 2 with running balance validation
+    val_pass2, meta_pass2 = validate_running_balance_chain(
+        [tx.model_copy() for tx in pass2_rows],
+        saldo_inicial=saldo_anterior_pagina,
+        modo_contable=modo_contable,
+        tolerance=tolerance
+    )
+
+    pass2_cumple = (
+        meta_pass2.get("filas_con_saldo", 0) > 0
+        and meta_pass2.get("cumplimiento_cadena_saldo") == 100.0
+    )
+
+    if pass2_cumple:
+        # Pass 2 squares the balance chain perfectly! Promote Pass 2 rows
+        promoted_rows = []
+        for tx in val_pass2:
+            tx.origen = "verificado_multipass"
+            compute_row_confidence(tx, cadena_ok=True, acuerdo_senales=True, fecha_en_periodo=True)
+            tx.estado_revision = "VERIFICADO"
+            promoted_rows.append(tx)
+        return promoted_rows, {
+            "status": "promoted_pass2",
+            "cadena_ok": True,
+            "cumplimiento_cadena_saldo": 100.0,
+            "filas_reconciliadas": len(promoted_rows)
+        }
+
+    # Neither pass squares the running balance, check for discrepancies between pass 1 and pass 2
+    reconciled_rows = []
+    discrepancy_count = 0
+
+    for i, tx1 in enumerate(pass1_rows):
+        tx1_copy = tx1.model_copy()
+        tx2 = pass2_rows[i] if i < len(pass2_rows) else None
+
+        has_diff = False
+        if tx2 is not None:
+            tipo1 = tx1_copy.tipo.value if hasattr(tx1_copy.tipo, "value") else str(tx1_copy.tipo)
+            tipo2 = tx2.tipo.value if hasattr(tx2.tipo, "value") else str(tx2.tipo)
+            if (
+                tx1_copy.fecha != tx2.fecha
+                or abs(round(tx1_copy.importe - tx2.importe, 2)) > tolerance
+                or tipo1.lower() != tipo2.lower()
+            ):
+                has_diff = True
+
+        if has_diff and tx2 is not None:
+            discrepancy_count += 1
+            tipo2_str = tx2.tipo.value if hasattr(tx2.tipo, "value") else str(tx2.tipo)
+            audit_note = f"[Discrepancia Pass 2: {tx2.fecha} | ${tx2.importe:.2f} | {tipo2_str}]"
+            tx1_copy.descripcion = f"{tx1_copy.descripcion} {audit_note}".strip()
+            tx1_copy.estado_revision = "DISCREPANCIA_OCR"
+            tx1_copy.confianza = min(getattr(tx1_copy, "confianza", 1.0), 0.40)
+        elif getattr(tx1_copy, "estado_revision", "") in ("REVISAR", "DISCREPANCIA_OCR"):
+            tx1_copy.confianza = min(getattr(tx1_copy, "confianza", 1.0), 0.40)
+
+        reconciled_rows.append(tx1_copy)
+
+    return reconciled_rows, {
+        "status": "discrepancia_ocr" if discrepancy_count > 0 else "unresolved",
+        "cadena_ok": False,
+        "discrepancies_detected": discrepancy_count
+    }
 
 

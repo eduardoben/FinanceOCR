@@ -10,11 +10,12 @@ Provides fast conversions to:
 
 import io
 import json
-from typing import List, Optional
+from typing import List, Optional, Dict, Any
 import pandas as pd
 import streamlit as st
 
 from models import Transaccion, TipoTransaccion, ReconciliacionResultado
+from parsers import infer_statement_mode
 
 
 
@@ -147,26 +148,34 @@ def render_clipboard_button(tsv_data: str, label: str = "Copiar a Portapapeles (
 def reconcile_transactions(
     transactions: List[Transaccion],
     saldo_inicial: Optional[float],
-    saldo_final: Optional[float]
+    saldo_final: Optional[float],
+    modo_contable: Optional[str] = None,
+    text: Optional[str] = None,
+    summary_data: Optional[Dict[str, Any]] = None,
 ) -> ReconciliacionResultado:
     """
     Performs arithmetic balance reconciliation to verify 100% extraction certainty.
-    Supports both standard debit accounts and credit card statements.
+    Eliminates dual-formula guesswork: strictly uses inferred or explicit accounting mode.
+    If mode is 'ambiguo', reconciliation is marked as cuadra = False.
+    Calculates running balance chain compliance if rows contain saldo_renglon.
 
     Args:
         transactions: List of extracted Transaccion items.
         saldo_inicial: Stated opening balance from document or None.
         saldo_final: Stated closing balance from document or None.
+        modo_contable: Optional explicit mode ('debito', 'credito', 'ambiguo').
+        text: Optional raw statement text for automatic mode inference.
+        summary_data: Optional dictionary with declared summary figures.
 
     Returns:
-        ReconciliacionResultado with calculations, difference, and certainty status.
+        ReconciliacionResultado with calculations, difference, certainty status, and chain metrics.
     """
     total_ingresos = round(
-        sum(float(tx.importe) for tx in transactions if tx.tipo == TipoTransaccion.INGRESO or tx.tipo == "ingreso"),
+        sum(float(tx.importe) for tx in transactions if tx.tipo == TipoTransaccion.INGRESO or str(tx.tipo).lower() in ("ingreso", "abono")),
         2
     )
     total_egresos = round(
-        sum(float(tx.importe) for tx in transactions if tx.tipo == TipoTransaccion.EGRESO or tx.tipo == "egreso"),
+        sum(float(tx.importe) for tx in transactions if tx.tipo == TipoTransaccion.EGRESO or str(tx.tipo).lower() in ("egreso", "cargo")),
         2
     )
 
@@ -174,45 +183,84 @@ def reconcile_transactions(
         return ReconciliacionResultado(
             saldo_inicial=saldo_inicial,
             saldo_final_declarado=saldo_final,
+            saldo_final_esperado=saldo_final,
             saldo_final_calculado=None,
             total_ingresos=total_ingresos,
             total_egresos=total_egresos,
+            total_abonos=total_ingresos,
+            total_cargos=total_egresos,
             diferencia=None,
+            cuadra=None,
             conciliado=None,
-            modo_calculo="no_disponible"
+            modo_calculo="no_disponible",
+            modo_contable="no_disponible"
         )
 
     s_ini = round(float(saldo_inicial), 2)
     s_fin = round(float(saldo_final), 2)
 
-    # 1. Debit / Checking equation: Saldo Inicial + Ingresos - Egresos
-    calc_debito = round(s_ini + total_ingresos - total_egresos, 2)
-    diff_debito = round(abs(calc_debito - s_fin), 2)
+    # Resolve modo_contable deterministically without guessing or picking min(diff)
+    effective_mode = modo_contable
+    if not effective_mode:
+        comb_text = text or ""
+        if not comb_text and transactions:
+            comb_text = " ".join(f"{tx.concepto} {tx.descripcion}" for tx in transactions)
+        effective_mode = infer_statement_mode(comb_text, summary_data or {})
 
-    # 2. Credit Card equation: Saldo Inicial - Ingresos (pagos) + Egresos (compras)
-    calc_credito = round(s_ini - total_ingresos + total_egresos, 2)
-    diff_credito = round(abs(calc_credito - s_fin), 2)
+    # Evaluate running balance chain if saldo_renglon is available on transaction rows
+    filas_con_saldo = 0
+    filas_cumplen = 0
+    running_bal = s_ini
+    for tx in transactions:
+        row_bal = getattr(tx, "saldo_renglon", None)
+        if row_bal is not None:
+            filas_con_saldo += 1
+            is_ingreso = tx.tipo == TipoTransaccion.INGRESO or str(tx.tipo).lower() in ("ingreso", "abono")
+            if effective_mode == "debito":
+                expected_row = running_bal + tx.importe if is_ingreso else running_bal - tx.importe
+            elif effective_mode == "credito":
+                expected_row = running_bal - tx.importe if is_ingreso else running_bal + tx.importe
+            else:
+                expected_row = running_bal
+            if abs(round(expected_row - row_bal, 2)) <= 0.01:
+                filas_cumplen += 1
+            running_bal = row_bal
 
-    if diff_debito <= diff_credito:
-        modo = "debito"
-        calc_final = calc_debito
-        diff = diff_debito
-    else:
-        modo = "credito"
-        calc_final = calc_credito
-        diff = diff_credito
+    cumplimiento_cadena = round((filas_cumplen / filas_con_saldo) * 100, 2) if filas_con_saldo > 0 else None
 
-    cuadra = diff <= 0.01
+    # Apply strict formula strictly based on the resolved mode
+    if effective_mode == "debito":
+        calc_final = round(s_ini + total_ingresos - total_egresos, 2)
+        diff = round(abs(calc_final - s_fin), 2)
+        cuadra = diff <= 0.01
+    elif effective_mode == "credito":
+        calc_final = round(s_ini - total_ingresos + total_egresos, 2)
+        diff = round(abs(calc_final - s_fin), 2)
+        cuadra = diff <= 0.01
+    else:  # "ambiguo"
+        effective_mode = "ambiguo"
+        calc_final = round(s_ini + total_ingresos - total_egresos, 2)
+        diff = round(abs(calc_final - s_fin), 2)
+        cuadra = False  # Ambiguous mode NEVER reconciles to True
+
+    conciliado = cuadra
 
     return ReconciliacionResultado(
         saldo_inicial=s_ini,
         saldo_final_declarado=s_fin,
+        saldo_final_esperado=s_fin,
         saldo_final_calculado=calc_final,
         total_ingresos=total_ingresos,
         total_egresos=total_egresos,
+        total_abonos=total_ingresos,
+        total_cargos=total_egresos,
         diferencia=diff,
         cuadra=cuadra,
-        conciliado=cuadra,
-        modo_calculo=modo
+        conciliado=conciliado,
+        modo_calculo=effective_mode,
+        modo_contable=effective_mode,
+        cumplimiento_cadena_saldo=cumplimiento_cadena,
+        filas_con_saldo=filas_con_saldo,
+        filas_cumplen_cadena=filas_cumplen
     )
 

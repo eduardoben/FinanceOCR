@@ -4,7 +4,12 @@ test_telemetry.py - Unit Tests for System Resource Telemetry & Stage Stopwatch
 
 import time
 import unittest
-from telemetry import get_system_metrics, StageStopwatch
+from telemetry import (
+    get_system_metrics,
+    StageStopwatch,
+    record_high_res_verification,
+    get_high_res_verification_telemetry,
+)
 
 
 class TestTelemetry(unittest.TestCase):
@@ -72,6 +77,24 @@ class TestTelemetry(unittest.TestCase):
         data = sw.to_dict()
         self.assertEqual(data["stages"], {})
         self.assertEqual(data["total_seconds"], 0.0)
+
+    def test_record_and_get_high_res_verification(self):
+        """Verifies recording and retrieving telemetry for high_res_verification_pass."""
+        rec = record_high_res_verification(
+            elapsed_seconds=1.85,
+            memory_mb=42.50,
+            pages_count=2,
+            stage_name="high_res_verification_pass"
+        )
+        self.assertEqual(rec["metric_name"], "high_res_verification_pass")
+        self.assertEqual(rec["elapsed_seconds"], 1.85)
+        self.assertEqual(rec["memory_mb"], 42.50)
+        self.assertEqual(rec["pages_count"], 2)
+
+        stored = get_high_res_verification_telemetry("high_res_verification_pass")
+        self.assertIsNotNone(stored)
+        self.assertEqual(stored["elapsed_seconds"], 1.85)
+        self.assertEqual(stored["pages_count"], 2)
 
 
 if __name__ == "__main__":

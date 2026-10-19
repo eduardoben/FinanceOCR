@@ -8,11 +8,20 @@ Enforces JSON Schema validation via Pydantic and handles Spanish banking context
 
 import json
 import time
-from typing import List, Tuple, Optional
+from typing import List, Tuple, Optional, Dict, Any, Union
 import httpx
 from pydantic import ValidationError
 
-from models import Transaccion, TransaccionesResponse
+from models import (
+    Transaccion,
+    TipoTransaccion,
+    TransaccionesResponse,
+    TransaccionPlana,
+    LLMTransaccionesList,
+    normalizar_tipo_transaccion,
+    auditar_fila_rechazada,
+    calcular_metricas_captura,
+)
 from date_utils import normalize_spanish_date, extract_statement_year
 
 import re
@@ -45,10 +54,34 @@ REGLAS CRÍTICAS DE EXTRACCIÓN Y CLASIFICACIÓN:
 """
 
 DATE_PATTERN = re.compile(
-    r"\b(?:\d{1,2}[-/\s](?:ene|feb|mar|abr|may|jun|jul|ago|sep|oct|nov|dic|[a-z]{3}|\d{1,2})[-/\s]\d{2,4}|\d{4}[-/\s]\d{1,2}[-/\s]\d{1,2})\b",
+    r"\b(?:"
+    r"\d{4}[-/\s]\d{1,2}[-/\s]\d{1,2}"  # YYYY-MM-DD
+    r"|\d{1,2}[-/\s](?:ene|feb|mar|abr|may|jun|jul|ago|sep|oct|nov|dic|[a-z]{3})(?:[-/\s]\d{2,4})?"  # 15 ENE, 15/ENE, 15-ENE, 15/ENE/2024
+    r"|\d{1,2}[-/\s]\d{1,2}[-/\s]\d{2,4}"  # 15/01/2024, 15-01-24
+    r"|\d{1,2}[-/]\d{1,2}"  # 15/01, 15-01
+    r"|\d{8}"  # 20240115
+    r")\b",
     re.IGNORECASE
 )
 MONEY_PATTERN = re.compile(r"(?:\$\s*[\d,]+\.\d{2}|[\d,]+\.\d{2})")
+
+
+def is_candidate_row(line: str) -> bool:
+    """
+    Evaluates whether a text or table row is a candidate transaction row.
+    """
+    stripped = line.strip()
+    return bool(DATE_PATTERN.search(stripped) and MONEY_PATTERN.search(stripped))
+
+
+def evaluar_linea_candidata(line: str) -> Dict[str, Any]:
+    """
+    Returns candidate status evaluation dictionary: {"candidata": bool, "linea": str}
+    """
+    return {
+        "candidata": is_candidate_row(line),
+        "linea": line
+    }
 
 
 def compact_markdown_tables(text: str) -> str:
@@ -193,7 +226,98 @@ def chunk_text(text: str, max_chunk_chars: int = 1800, max_table_rows: int = 6) 
 import re
 
 
-def clean_and_parse_llm_json(raw_content: str, thinking_content: str = "") -> List[Transaccion]:
+def _process_candidate_tx_dict(
+    item: Any,
+    out_list: List[Transaccion],
+    filas_rechazadas: Optional[List[Dict[str, Any]]] = None
+):
+    if not isinstance(item, dict):
+        if filas_rechazadas is not None:
+            filas_rechazadas.append(auditar_fila_rechazada(
+                linea_origen="",
+                datos_crudos=item,
+                motivo="validacion_esquema",
+                detalle_error="El registro no es un diccionario JSON"
+            ))
+        return
+
+    linea_origen = str(item.get("linea_origen") or item.get("descripcion") or item.get("concepto") or item)
+    raw_fecha = str(item.get("fecha") or "")
+    raw_importe = item.get("importe")
+    raw_tipo = str(item.get("tipo") or "")
+    raw_desc = str(item.get("descripcion") or item.get("concepto") or "")
+    raw_concepto = str(item.get("concepto") or raw_desc[:30] or "Transaccion")
+
+    # 1. Validar fecha
+    if not raw_fecha.strip():
+        if filas_rechazadas is not None:
+            filas_rechazadas.append(auditar_fila_rechazada(
+                linea_origen=linea_origen,
+                datos_crudos=item,
+                motivo="fecha_invalida",
+                detalle_error="Fecha no especificada o vacía"
+            ))
+        return
+
+    norm_fecha = normalize_spanish_date(raw_fecha)
+    if not norm_fecha or not re.match(r"^\d{4}-\d{2}-\d{2}$", norm_fecha):
+        if filas_rechazadas is not None:
+            filas_rechazadas.append(auditar_fila_rechazada(
+                linea_origen=linea_origen,
+                datos_crudos=item,
+                motivo="fecha_invalida",
+                detalle_error=f"Fecha '{raw_fecha}' no válida"
+            ))
+        return
+
+    # 2. Validar importe
+    amt = Transaccion.sanitize_importe(raw_importe)
+    if amt <= 0.001:
+        if filas_rechazadas is not None:
+            filas_rechazadas.append(auditar_fila_rechazada(
+                linea_origen=linea_origen,
+                datos_crudos=item,
+                motivo="importe_cero",
+                detalle_error=f"Importe {raw_importe} es menor o igual a cero"
+            ))
+        return
+
+    # 3. Normalizar tipo antes de instanciar Transaccion
+    norm_tipo = normalizar_tipo_transaccion(raw_tipo)
+
+    # 4. Validar e instanciar Transaccion
+    try:
+        tx = Transaccion(
+            fecha=norm_fecha,
+            concepto=raw_concepto.strip() or "Movimiento",
+            importe=amt,
+            descripcion=raw_desc.strip() or raw_concepto.strip(),
+            tipo=norm_tipo
+        )
+        out_list.append(tx)
+    except ValidationError as e:
+        if filas_rechazadas is not None:
+            filas_rechazadas.append(auditar_fila_rechazada(
+                linea_origen=linea_origen,
+                datos_crudos=item,
+                motivo="validacion_esquema",
+                detalle_error=str(e)
+            ))
+    except Exception as e:
+        if filas_rechazadas is not None:
+            filas_rechazadas.append(auditar_fila_rechazada(
+                linea_origen=linea_origen,
+                datos_crudos=item,
+                motivo="validacion_esquema",
+                detalle_error=str(e)
+            ))
+
+
+def clean_and_parse_llm_json(
+    raw_content: str,
+    thinking_content: str = "",
+    filas_rechazadas: Optional[List[Dict[str, Any]]] = None
+) -> List[Transaccion]:
     """
     Robust JSON parser for local LLM structured outputs.
     Handles:
@@ -201,6 +325,7 @@ def clean_and_parse_llm_json(raw_content: str, thinking_content: str = "") -> Li
     - Reasoning model thinking tokens (<think>...</think> or separate thinking field).
     - Markdown code fences (```json ... ```).
     - Malformed responses or trailing text.
+    - Structured rejection auditing for invalid rows.
     """
     candidate = (raw_content or "").strip()
 
@@ -239,25 +364,13 @@ def clean_and_parse_llm_json(raw_content: str, thinking_content: str = "") -> Li
         if isinstance(data, dict):
             if "transacciones" in data and isinstance(data["transacciones"], list):
                 for item in data["transacciones"]:
-                    if isinstance(item, dict):
-                        try:
-                            tx = Transaccion.model_validate(item)
-                            tx_list.append(tx)
-                        except ValidationError:
-                            pass
+                    _process_candidate_tx_dict(item, tx_list, filas_rechazadas)
             elif "fecha" in data and "concepto" in data:
-                try:
-                    tx_list.append(Transaccion.model_validate(data))
-                except ValidationError:
-                    pass
+                _process_candidate_tx_dict(data, tx_list, filas_rechazadas)
 
         elif isinstance(data, list):
             for item in data:
-                if isinstance(item, dict):
-                    try:
-                        tx_list.append(Transaccion.model_validate(item))
-                    except ValidationError:
-                        pass
+                _process_candidate_tx_dict(item, tx_list, filas_rechazadas)
 
         return tx_list
 
@@ -270,12 +383,114 @@ def clean_and_parse_llm_json(raw_content: str, thinking_content: str = "") -> Li
     for dict_str in dict_patterns:
         try:
             item = json.loads(dict_str)
-            tx = Transaccion.model_validate(item)
-            salvaged_txs.append(tx)
+            _process_candidate_tx_dict(item, salvaged_txs, filas_rechazadas)
         except Exception:
             continue
 
     return salvaged_txs
+
+
+def parse_strict_llm_json(
+    raw_response: str,
+    filas_rechazadas: Optional[List[Dict[str, Any]]] = None
+) -> List[Transaccion]:
+    """
+    Parses and validates strict JSON returned by Ollama.
+    Wraps clean_and_parse_llm_json to extract and validate JSON transactions.
+    """
+    if not raw_response or not raw_response.strip():
+        return []
+    return clean_and_parse_llm_json(raw_response, filas_rechazadas=filas_rechazadas)
+
+
+def parse_heuristic_fallback(
+    text_chunk: str,
+    thinking_content: str = "",
+    default_year: Optional[int] = None,
+    original_chunk: str = ""
+) -> List[Transaccion]:
+    """
+    Heuristic/regex fallback extractor when Ollama fails to return valid JSON after retries.
+    
+    1. Attempts to salvage individual transaction dictionaries from text_chunk / thinking_content.
+    2. If no valid transactions are found, parses tabular/text lines using DATE_PATTERN and MONEY_PATTERN,
+       classifying cash flow (ingreso/egreso) based on Spanish banking keywords.
+    """
+    # 1. Try salvaging from raw LLM output or thinking content
+    salvaged = clean_and_parse_llm_json(text_chunk, thinking_content)
+    if salvaged:
+        return salvaged
+
+    # 2. Line-by-line regex extraction over text_chunk or original_chunk
+    source_text = text_chunk if (text_chunk and (DATE_PATTERN.search(text_chunk) and MONEY_PATTERN.search(text_chunk))) else original_chunk
+    if not source_text or not source_text.strip():
+        return []
+
+    from models import TipoTransaccion
+
+    expense_keywords = ["cargo", "retiro", "compra", "cgo", "disposicion", "comision", "iva", "pago servicio"]
+    income_keywords = ["abono", "deposito", "nomina", "sueldo", "reembolso", "devolucion", "bonificacion", "spei recibido"]
+
+    extracted_txs: List[Transaccion] = []
+    lines = source_text.split("\n")
+
+    for line in lines:
+        stripped = line.strip()
+        if not stripped:
+            continue
+
+        date_m = DATE_PATTERN.search(stripped)
+        money_m = MONEY_PATTERN.findall(stripped)
+        if not date_m or not money_m:
+            continue
+
+        raw_date = date_m.group(0)
+        norm_date = normalize_spanish_date(raw_date, default_year=default_year)
+
+        raw_amount_str = money_m[0]
+        cleaned_amount = Transaccion.sanitize_importe(raw_amount_str)
+        if cleaned_amount <= 0.001 and len(money_m) > 1:
+            cleaned_amount = Transaccion.sanitize_importe(money_m[1])
+        if cleaned_amount <= 0.001:
+            continue
+
+        desc = stripped
+        if "|" in desc:
+            cells = [c.strip() for c in desc.split("|") if c.strip()]
+            desc_candidates = [
+                c for c in cells
+                if not DATE_PATTERN.search(c) and not MONEY_PATTERN.search(c)
+            ]
+            desc = " ".join(desc_candidates) if desc_candidates else " ".join(cells)
+        else:
+            desc = DATE_PATTERN.sub("", desc)
+            for m in money_m:
+                desc = desc.replace(m, "")
+        desc = " ".join(desc.strip().split())
+        if not desc:
+            desc = "Movimiento bancario"
+
+        concepto = desc[:30].strip() or "Movimiento"
+
+        line_lower = stripped.lower()
+        if any(kw in line_lower for kw in income_keywords):
+            tipo = TipoTransaccion.INGRESO
+        else:
+            tipo = TipoTransaccion.EGRESO
+
+        try:
+            tx = Transaccion(
+                fecha=norm_date,
+                concepto=concepto,
+                importe=cleaned_amount,
+                descripcion=stripped,
+                tipo=tipo
+            )
+            extracted_txs.append(tx)
+        except Exception:
+            continue
+
+    return extracted_txs
 
 
 def clean_description(desc: str) -> str:
@@ -331,30 +546,33 @@ def deduplicate_adjacent_chunks(
 ) -> List[Transaccion]:
     """
     Deduplicates transactions between adjacent chunks (chunk_i, chunk_i+1):
-    - Compares only the last `boundary_window` movements of chunk_i against the first `boundary_window` of chunk_i+1
-      using the tuple: (fecha, round(importe, 2), descripcion_limpia).
-    - Preserves legitimate twin transactions within the chunks unless they share an explicit identical bank reference.
+    - Non-overlapping chunks: NEVER deletes transactions with equal (fecha, importe, descripcion)
+      across chunk boundaries UNLESS both rows possess an explicit non-empty bank reference/folio
+      that is exactly identical.
+    - Preserves legitimate twin transactions within and across chunks.
 
     Returns:
-        List[Transaccion]: The filtered transactions from chunk_next_txs that were not repeated from chunk_i boundary.
+        List[Transaccion]: The filtered transactions from chunk_next_txs.
     """
     if not chunk_i_txs or not chunk_next_txs:
         return deduplicate_within_chunk(chunk_next_txs)
 
-    # Clean the tail of chunk_i
+    # Collect explicit non-empty bank references from the tail of chunk_i
     tail = chunk_i_txs[-boundary_window:]
-    tail_keys = {
-        (tx.fecha, round(float(tx.importe), 2), clean_description(tx.descripcion))
-        for tx in tail
-    }
+    tail_refs = set()
+    for tx in tail:
+        ref = extract_explicit_bank_reference(tx.descripcion)
+        if ref:
+            tail_refs.add((tx.fecha, round(float(tx.importe), 2), ref))
 
-    # Filter out boundary duplicates from the head of chunk_next_txs
+    # Filter chunk_next_txs at boundary ONLY if matching non-empty explicit bank reference exists
     filtered_next: List[Transaccion] = []
     for idx, tx in enumerate(chunk_next_txs):
-        key = (tx.fecha, round(float(tx.importe), 2), clean_description(tx.descripcion))
-        if idx < boundary_window and key in tail_keys:
-            # Overlapping boundary duplicate row from previous table chunk
-            continue
+        if idx < boundary_window:
+            ref = extract_explicit_bank_reference(tx.descripcion)
+            if ref and (tx.fecha, round(float(tx.importe), 2), ref) in tail_refs:
+                # Deduplicate only when both share identical explicit bank reference
+                continue
         filtered_next.append(tx)
 
     # Within the remaining chunk_next_txs, deduplicate only identical bank references
@@ -385,8 +603,10 @@ def extract_transactions_with_ollama(
     base_url: str = "http://localhost:11434",
     model: str = "gemma4:12b",
     num_ctx: int = 8192,
-    timeout_seconds: float = 180.0
-) -> List[Transaccion]:
+    timeout_seconds: float = 180.0,
+    filas_rechazadas_out: Optional[List[Dict[str, Any]]] = None,
+    return_metrics: bool = False
+) -> Union[List[Transaccion], Tuple[List[Transaccion], Dict[str, Any]]]:
     """
     Sends document markdown/text to Ollama using robust table-aware chunking and Pydantic validation.
     
@@ -395,8 +615,9 @@ def extract_transactions_with_ollama(
     2. Bounded Chunking: Preserves multi-row table headers while bounding rows per chunk (<=14 rows)
        to prevent reasoning model token traps.
     3. Fast Pre-Flight Filtering: Bypasses non-financial disclaimer blocks to reduce inference time by >70%.
-    4. Temperature 0.7 & Free-Form Thinking: Prevents greedy repetitive loops at temp 0.0 and grammar deadlocks.
+    4. Temperature 0.0 & Free-Form Thinking: Deterministic temperature 0.0 for accounting certainty and JSON compliance.
     5. Robust Pydantic Parsing: Parses and validates JSON responses with graceful recovery.
+    6. Structured Audit Tracking: Retains rejected rows and capture metrics.
     """
     clean_url = base_url.rstrip("/")
     compacted_text = compact_markdown_tables(text_content)
@@ -404,7 +625,15 @@ def extract_transactions_with_ollama(
 
     # Filter candidate chunks containing financial transactions
     candidate_chunks = [c for c in all_chunks if chunk_has_transaction_rows(c)]
+    filas_candidatas = sum(1 for line in text_content.split("\n") if is_candidate_row(line))
+    doc_filas_rechazadas: List[Dict[str, Any]] = []
+
     if not candidate_chunks:
+        metricas = calcular_metricas_captura(filas_candidatas, 0, doc_filas_rechazadas)
+        if filas_rechazadas_out is not None:
+            filas_rechazadas_out.extend(doc_filas_rechazadas)
+        if return_metrics:
+            return [], metricas
         return []
 
     statement_year = extract_statement_year(text_content)
@@ -415,7 +644,6 @@ def extract_transactions_with_ollama(
     )
 
     all_transactions: List[Transaccion] = []
-    prev_chunk_keys = set()
 
     with httpx.Client(timeout=timeout_seconds) as client:
         for chunk_idx, chunk in enumerate(candidate_chunks):
@@ -440,11 +668,11 @@ def extract_transactions_with_ollama(
                     }
                 ],
                 "stream": False,
-                "format": "json",
+                "format": LLMTransaccionesList.model_json_schema(),
                 "options": {
                     "temperature": 0.0,
-                    "num_ctx": 8192,
-                    "num_predict": 8192
+                    "num_ctx": num_ctx,
+                    "num_predict": num_ctx
                 }
             }
 
@@ -468,7 +696,7 @@ def extract_transactions_with_ollama(
 
                     # Strict JSON parsing first
                     try:
-                        chunk_txs = parse_strict_llm_json(raw_message_content)
+                        chunk_txs = parse_strict_llm_json(raw_message_content, filas_rechazadas=doc_filas_rechazadas)
                         if chunk_txs or not raw_message_content.strip():
                             success = True
                         else:
@@ -482,7 +710,12 @@ def extract_transactions_with_ollama(
                         else:
                             # Invoke heuristic fallback after max retries
                             print(f"[Ollama] Invocando fallback heurístico en fragmento {chunk_idx + 1} tras agotar reintentos de parseo...")
-                            chunk_txs = parse_heuristic_fallback(raw_message_content, thinking_content)
+                            chunk_txs = parse_heuristic_fallback(
+                                raw_message_content,
+                                thinking_content=thinking_content,
+                                default_year=statement_year,
+                                original_chunk=chunk
+                            )
                             success = True
 
                 except (httpx.ConnectError, httpx.TimeoutException) as conn_err:
@@ -511,20 +744,58 @@ def extract_transactions_with_ollama(
                     if attempt <= max_retries:
                         time.sleep(1.0)
                     else:
-                        chunk_txs = parse_heuristic_fallback(raw_message_content, thinking_content)
+                        chunk_txs = parse_heuristic_fallback(
+                            raw_message_content,
+                            thinking_content=thinking_content,
+                            default_year=statement_year,
+                            original_chunk=chunk
+                        )
                         success = True
 
             if not success:
-                chunk_txs = parse_heuristic_fallback(raw_message_content, thinking_content)
+                chunk_txs = parse_heuristic_fallback(
+                    raw_message_content,
+                    thinking_content=thinking_content,
+                    default_year=statement_year,
+                    original_chunk=chunk
+                )
 
             # Normalize date with statement year fallback
             for tx in chunk_txs:
                 tx.fecha = normalize_spanish_date(tx.fecha, default_year=statement_year)
 
-            valid_chunk_txs = [tx for tx in chunk_txs if tx.importe > 0.001]
+            valid_chunk_txs = []
+            for tx in chunk_txs:
+                if tx.importe > 0.001:
+                    valid_chunk_txs.append(tx)
+                else:
+                    doc_filas_rechazadas.append(auditar_fila_rechazada(
+                        linea_origen=tx.descripcion,
+                        datos_crudos=tx.model_dump(),
+                        motivo="importe_cero",
+                        detalle_error="Importe igual o menor a cero tras extracción"
+                    ))
+
             deduped = deduplicate_adjacent_chunks(all_transactions, valid_chunk_txs, boundary_window=5)
             all_transactions.extend(deduped)
 
-    print(f"[Ollama] Extracción finalizada: {len(all_transactions)} transacciones identificadas.")
+    if filas_rechazadas_out is not None:
+        filas_rechazadas_out.extend(doc_filas_rechazadas)
+
+    metricas = calcular_metricas_captura(filas_candidatas, len(all_transactions), doc_filas_rechazadas)
+    print(
+        f"[Ollama] Extracción finalizada: {len(all_transactions)} transacciones identificadas "
+        f"(Cobertura: {metricas['cobertura'] * 100:.1f}%, Rechazos: {len(doc_filas_rechazadas)})."
+    )
+
+    if return_metrics:
+        return all_transactions, metricas
     return all_transactions
+
+
+def reconcile_extraction_passes(*args, **kwargs):
+    """Reconciles extraction passes (forwarded to parsers.reconcile_extraction_passes)."""
+    from parsers import reconcile_extraction_passes as _rep
+    return _rep(*args, **kwargs)
+
 

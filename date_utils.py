@@ -24,6 +24,36 @@ SPANISH_MONTH_MAP = {
     "dic": 12, "diciembre": 12, "dec": 12,
 }
 
+DATE_PATTERN = re.compile(
+    r"\b(?:"
+    r"\d{4}[-/\s]\d{1,2}[-/\s]\d{1,2}"
+    r"|\d{1,2}[-/\s](?:ene|feb|mar|abr|may|jun|jul|ago|sep|oct|nov|dic|[a-z]{3})(?:[-/\s]\d{2,4})?"
+    r"|\d{1,2}[-/\s]\d{1,2}[-/\s]\d{2,4}"
+    r"|\d{1,2}[-/]\d{1,2}"
+    r"|\d{8}"
+    r")\b",
+    re.IGNORECASE
+)
+MONEY_PATTERN = re.compile(r"(?:\$\s*[\d,]+\.\d{2}|[\d,]+\.\d{2})")
+
+
+def is_candidate_row(line: str) -> bool:
+    """
+    Checks if a line contains a candidate banking date and amount.
+    """
+    stripped = line.strip()
+    return bool(DATE_PATTERN.search(stripped) and MONEY_PATTERN.search(stripped))
+
+
+def evaluar_linea_candidata(line: str) -> Dict[str, Any]:
+    """
+    Evaluates a line returning candidate transaction status.
+    """
+    return {
+        "candidata": is_candidate_row(line),
+        "linea": line
+    }
+
 
 def _build_valid_iso_date(year: int, month: int, day: int) -> Optional[str]:
     """
@@ -121,6 +151,21 @@ def extract_statement_period(text: str) -> Optional[Dict[str, int]]:
         return None
 
     cleaned = text.strip().lower()
+
+    # If text is a multiline document, scan lines for period headers or date range delimiters
+    if "\n" in cleaned:
+        period_match = re.search(r"(?:periodo|corte|del)\s*:?\s*([^\n\r]+)", cleaned, re.IGNORECASE)
+        if period_match:
+            res = extract_statement_period(period_match.group(1))
+            if res:
+                return res
+        for line in cleaned.splitlines():
+            s_line = line.strip()
+            if re.search(r"\b(?:al|–|—|-)\b", s_line, re.IGNORECASE) and re.search(r"\d{1,2}", s_line):
+                res = extract_statement_period(s_line)
+                if res:
+                    return res
+        return None
 
     # Split on period range delimiters: "-", " al ", " a ", " to "
     parts = re.split(r"\s*(?:-|–|—|\bal\b|\ba\b)\s*", cleaned)

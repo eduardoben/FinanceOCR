@@ -138,7 +138,11 @@ def init_db(db_path: str = DEFAULT_DB_PATH) -> None:
         saldo_inicial REAL,
         saldo_final REAL,
         diferencia_conciliacion REAL,
-        conciliado INTEGER
+        conciliado INTEGER,
+        estado_conciliacion TEXT,
+        modo_contable TEXT,
+        cobertura REAL,
+        metricas_json TEXT
     );
 
     CREATE TABLE IF NOT EXISTS transacciones (
@@ -149,6 +153,23 @@ def init_db(db_path: str = DEFAULT_DB_PATH) -> None:
         importe REAL NOT NULL,
         descripcion TEXT,
         tipo TEXT NOT NULL CHECK(tipo IN ('ingreso', 'egreso')),
+        confianza REAL DEFAULT 1.0,
+        origen TEXT DEFAULT 'llm',
+        linea_origen TEXT DEFAULT '',
+        saldo_renglon REAL,
+        estado_revision TEXT DEFAULT 'pendiente',
+        pagina INTEGER DEFAULT 1,
+        FOREIGN KEY (archivo_id) REFERENCES archivos_procesados(id) ON DELETE CASCADE
+    );
+
+    CREATE TABLE IF NOT EXISTS filas_rechazadas (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        archivo_id INTEGER NOT NULL,
+        linea_origen TEXT,
+        datos_crudos TEXT,
+        motivo TEXT,
+        detalle_error TEXT,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
         FOREIGN KEY (archivo_id) REFERENCES archivos_procesados(id) ON DELETE CASCADE
     );
 
@@ -156,6 +177,7 @@ def init_db(db_path: str = DEFAULT_DB_PATH) -> None:
     CREATE INDEX IF NOT EXISTS idx_transacciones_concepto ON transacciones(concepto);
     CREATE INDEX IF NOT EXISTS idx_transacciones_tipo ON transacciones(tipo);
     CREATE INDEX IF NOT EXISTS idx_transacciones_archivo ON transacciones(archivo_id);
+    CREATE INDEX IF NOT EXISTS idx_filas_rechazadas_archivo ON filas_rechazadas(archivo_id);
     CREATE INDEX IF NOT EXISTS idx_archivos_nombre ON archivos_procesados(nombre_archivo);
     CREATE INDEX IF NOT EXISTS idx_archivos_hash ON archivos_procesados(hash_sha256);
 
@@ -181,9 +203,26 @@ def init_db(db_path: str = DEFAULT_DB_PATH) -> None:
             ("saldo_final", "REAL"),
             ("diferencia_conciliacion", "REAL"),
             ("conciliado", "INTEGER"),
+            ("estado_conciliacion", "TEXT"),
+            ("modo_contable", "TEXT"),
+            ("cobertura", "REAL"),
+            ("metricas_json", "TEXT"),
         ]:
             try:
                 conn.execute(f"ALTER TABLE archivos_procesados ADD COLUMN {col} {col_type};")
+            except sqlite3.OperationalError:
+                pass
+
+        for col, col_type in [
+            ("confianza", "REAL DEFAULT 1.0"),
+            ("origen", "TEXT DEFAULT 'llm'"),
+            ("linea_origen", "TEXT DEFAULT ''"),
+            ("saldo_renglon", "REAL"),
+            ("estado_revision", "TEXT DEFAULT 'pendiente'"),
+            ("pagina", "INTEGER DEFAULT 1"),
+        ]:
+            try:
+                conn.execute(f"ALTER TABLE transacciones ADD COLUMN {col} {col_type};")
             except sqlite3.OperationalError:
                 pass
 
@@ -334,7 +373,8 @@ def check_file_processed(
     SELECT id, nombre_archivo, hash_sha256, tipo_archivo, fecha_procesamiento,
            total_transacciones, rango_fecha_inicio, rango_fecha_fin,
            ruta_archivo, tamano_bytes,
-           saldo_inicial, saldo_final, diferencia_conciliacion, conciliado
+           saldo_inicial, saldo_final, diferencia_conciliacion, conciliado,
+           estado_conciliacion, modo_contable, cobertura, metricas_json
     FROM archivos_procesados
     WHERE hash_sha256 = ?
     LIMIT 1;
@@ -359,6 +399,11 @@ def save_processed_transactions(
     saldo_final: Optional[float] = None,
     diferencia_conciliacion: Optional[float] = None,
     conciliado: Optional[bool] = None,
+    estado_conciliacion: Optional[str] = None,
+    modo_contable: Optional[str] = None,
+    cobertura: Optional[float] = None,
+    metricas_json: Optional[str] = None,
+    filas_rechazadas: Optional[List[Dict[str, Any]]] = None,
     db_path: str = DEFAULT_DB_PATH
 ) -> int:
     """
@@ -379,6 +424,11 @@ def save_processed_transactions(
         saldo_final: Optional closing balance stated in document.
         diferencia_conciliacion: Optional difference from arithmetic reconciliation.
         conciliado: Optional boolean flag indicating mathematical reconciliation.
+        estado_conciliacion: Optional document classification ('VERIFICADO', 'REVISAR', 'RECHAZADO').
+        modo_contable: Optional accounting mode ('debito', 'credito', 'ambiguo').
+        cobertura: Optional capture coverage ratio (0.0 to 1.0).
+        metricas_json: Optional serialized JSON string of extraction metrics.
+        filas_rechazadas: Optional list of audited rejected rows to persist.
         db_path: Database path.
 
     Returns:
@@ -416,7 +466,7 @@ def save_processed_transactions(
                     except Exception:
                         pass
 
-            # Delete prior record solely by hash
+            # Delete prior record solely by hash (cascades to transacciones and filas_rechazadas)
             conn.execute(
                 "DELETE FROM archivos_procesados WHERE hash_sha256 = ?;",
                 (file_hash,)
@@ -432,8 +482,10 @@ def save_processed_transactions(
                 rango_fecha_inicio, rango_fecha_fin,
                 ruta_archivo, tamano_bytes,
                 saldo_inicial, saldo_final,
-                diferencia_conciliacion, conciliado
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+                diferencia_conciliacion, conciliado,
+                estado_conciliacion, modo_contable,
+                cobertura, metricas_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
             """,
             (
                 filename,
@@ -448,13 +500,16 @@ def save_processed_transactions(
                 saldo_inicial,
                 saldo_final,
                 diferencia_conciliacion,
-                conciliado_int
+                conciliado_int,
+                estado_conciliacion,
+                modo_contable,
+                cobertura,
+                metricas_json
             )
         )
         archivo_id = cursor.lastrowid
 
-
-        # Batch insert transactions
+        # Batch insert transactions with full traceability
         tx_rows = []
         for tx in transactions:
             tipo_val = tx.tipo.value if hasattr(tx.tipo, "value") else str(tx.tipo)
@@ -464,20 +519,81 @@ def save_processed_transactions(
                 tx.concepto,
                 float(tx.importe),
                 tx.descripcion,
-                tipo_val
+                tipo_val,
+                float(getattr(tx, "confianza", 1.0)),
+                str(getattr(tx, "origen", "llm")),
+                str(getattr(tx, "linea_origen", "")),
+                float(tx.saldo_renglon) if getattr(tx, "saldo_renglon", None) is not None else None,
+                str(getattr(tx, "estado_revision", "pendiente")),
+                int(getattr(tx, "pagina", 1))
             ))
 
         if tx_rows:
             conn.executemany(
                 """
                 INSERT INTO transacciones (
-                    archivo_id, fecha, concepto, importe, descripcion, tipo
-                ) VALUES (?, ?, ?, ?, ?, ?);
+                    archivo_id, fecha, concepto, importe, descripcion, tipo,
+                    confianza, origen, linea_origen, saldo_renglon, estado_revision, pagina
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
                 """,
                 tx_rows
             )
 
+        # Batch insert audited rejected rows if provided
+        if filas_rechazadas:
+            rech_rows = []
+            for r in filas_rechazadas:
+                raw_d = r.get("datos_crudos", "")
+                if not isinstance(raw_d, str):
+                    try:
+                        raw_d = json.dumps(raw_d, ensure_ascii=False)
+                    except Exception:
+                        raw_d = str(raw_d)
+                rech_rows.append((
+                    archivo_id,
+                    str(r.get("linea_origen", "")),
+                    raw_d,
+                    str(r.get("motivo", "rechazo_general")),
+                    str(r.get("detalle_error", ""))
+                ))
+            conn.executemany(
+                """
+                INSERT INTO filas_rechazadas (
+                    archivo_id, linea_origen, datos_crudos, motivo, detalle_error
+                ) VALUES (?, ?, ?, ?, ?);
+                """,
+                rech_rows
+            )
+
         return archivo_id
+
+
+def get_filas_rechazadas(
+    archivo_id: Optional[int] = None,
+    db_path: str = DEFAULT_DB_PATH
+) -> List[Dict[str, Any]]:
+    """
+    Recupera los registros estructurados de auditoría para filas descartadas.
+
+    Args:
+        archivo_id: ID opcional de archivo procesado. Si es None, retorna las últimas 500 filas.
+        db_path: Ruta a la base de datos SQLite.
+
+    Returns:
+        List[Dict[str, Any]]: Lista de registros de auditoría.
+    """
+    init_db(db_path)
+    with db_session(db_path) as conn:
+        if archivo_id is not None:
+            rows = conn.execute(
+                "SELECT id, archivo_id, linea_origen, datos_crudos, motivo, detalle_error, created_at FROM filas_rechazadas WHERE archivo_id = ? ORDER BY id ASC;",
+                (archivo_id,)
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT id, archivo_id, linea_origen, datos_crudos, motivo, detalle_error, created_at FROM filas_rechazadas ORDER BY id DESC LIMIT 500;"
+            ).fetchall()
+        return [dict(r) for r in rows]
 
 
 def query_transactions(
@@ -536,6 +652,12 @@ def query_transactions(
         t.importe,
         t.descripcion AS descripción,
         t.tipo,
+        t.confianza,
+        t.origen,
+        t.linea_origen,
+        t.saldo_renglon,
+        t.estado_revision,
+        t.pagina,
         a.nombre_archivo,
         t.archivo_id
     FROM transacciones t
@@ -549,7 +671,9 @@ def query_transactions(
 
     if df.empty:
         return pd.DataFrame(columns=[
-            "id", "fecha", "concepto", "importe", "descripción", "tipo", "nombre_archivo", "archivo_id"
+            "id", "fecha", "concepto", "importe", "descripción", "tipo",
+            "confianza", "origen", "linea_origen", "saldo_renglon", "estado_revision",
+            "pagina", "nombre_archivo", "archivo_id"
         ])
 
     return df
@@ -570,7 +694,8 @@ def get_distinct_files(db_path: str = DEFAULT_DB_PATH) -> List[Dict[str, Any]]:
     SELECT id, nombre_archivo, tipo_archivo, fecha_procesamiento,
            total_transacciones, rango_fecha_inicio, rango_fecha_fin,
            hash_sha256, ruta_archivo, tamano_bytes,
-           saldo_inicial, saldo_final, diferencia_conciliacion, conciliado
+           saldo_inicial, saldo_final, diferencia_conciliacion, conciliado,
+           estado_conciliacion, modo_contable, cobertura, metricas_json
     FROM archivos_procesados
     ORDER BY id DESC;
     """

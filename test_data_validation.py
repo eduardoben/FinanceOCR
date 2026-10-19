@@ -24,11 +24,30 @@ from models import (
     Transaccion,
     TipoTransaccion,
     TransaccionesResponse,
+    TransaccionPlana,
+    LLMTransaccionesList,
+    normalizar_tipo_transaccion,
+    auditar_fila_rechazada,
+    calcular_metricas_captura,
     ReconciliacionResultado,
     sanitize_importe,
     validar_reconciliacion,
+    compute_row_confidence,
+    clasificar_estado_documento,
 )
-from date_utils import normalize_spanish_date, resolve_year_for_month, extract_statement_period
+from parsers import (
+    parse_docling_markdown_tables,
+    validate_running_balance_chain,
+)
+from date_utils import (
+    normalize_spanish_date,
+    resolve_year_for_month,
+    extract_statement_period,
+    DATE_PATTERN,
+    is_candidate_row,
+    evaluar_linea_candidata,
+)
+from llm_client import deduplicate_adjacent_chunks, parse_strict_llm_json
 from database import (
     db_session,
     init_db,
@@ -471,6 +490,177 @@ class TestDataValidationAndIntegrity(unittest.TestCase):
         period_tuple = ("2023-12-01", "2024-01-31")
         self.assertEqual(normalize_spanish_date("31/DIC", statement_period=period_tuple), "2023-12-31")
         self.assertEqual(normalize_spanish_date("02/ENE", statement_period=period_tuple), "2024-01-02")
+
+    def test_fase1_candidate_dates_and_flow_normalization(self):
+        """
+        Verifies:
+        1. Rows with dates '15 ENE', '15/ENE', '15/01' marked as candidates (candidata=True).
+        2. Normalization of flow variants to canonical EGRESO and INGRESO.
+        3. Flat schema LLMTransaccionesList and TransaccionPlana instantiation.
+        """
+        # 1. Candidate row evaluation
+        test_rows = [
+            "15 ENE COMPRA OXXO $120.00",
+            "15/ENE CARGO FARMACIA $450.50",
+            "15/01 PAGO CFE $350.00",
+            "| 15-ENE | RETIRO CAJERO | 1000.00 |",
+            "| 15/01/2024 | DEPOSITO NOMINA | 15000.00 |",
+        ]
+        for row in test_rows:
+            self.assertTrue(is_candidate_row(row), f"Row should be candidate: {row}")
+            res = evaluar_linea_candidata(row)
+            self.assertTrue(res["candidata"], f"Result must have candidata=True: {row}")
+
+        # Non-candidate rows
+        non_candidate = "ESTADO DE CUENTA MENSUAL - BBVA BANCOMER"
+        self.assertFalse(is_candidate_row(non_candidate))
+        self.assertFalse(evaluar_linea_candidata(non_candidate)["candidata"])
+
+        # 2. Flow normalization:
+        # 'cargo', 'egreso', 'retiro', 'compra' -> 'EGRESO'
+        for v in ["cargo", "egreso", "retiro", "compra", "CARGO", "EGRESO", "RETIRO", "COMPRA"]:
+            self.assertEqual(normalizar_tipo_transaccion(v), "EGRESO")
+        # 'abono', 'ingreso', 'deposito', 'pago' -> 'INGRESO'
+        for v in ["abono", "ingreso", "deposito", "pago", "ABONO", "INGRESO", "DEPOSITO", "PAGO"]:
+            self.assertEqual(normalizar_tipo_transaccion(v), "INGRESO")
+
+        # 3. Flat schema LLMTransaccionesList
+        plana = TransaccionPlana(
+            fecha="15 ENE",
+            descripcion="COMPRA WALMART",
+            importe=1250.50,
+            tipo="cargo",
+            referencia="REF1234",
+            saldo_renglon=5000.0,
+            linea_origen="15 ENE COMPRA WALMART $1250.50"
+        )
+        self.assertEqual(plana.importe, 1250.50)
+        self.assertEqual(plana.tipo, "cargo")
+        self.assertEqual(plana.referencia, "REF1234")
+        self.assertEqual(plana.saldo_renglon, 5000.0)
+
+        schema = LLMTransaccionesList.model_json_schema()
+        self.assertIn("properties", schema)
+        self.assertIn("transacciones", schema["properties"])
+
+    def test_fase1_structured_rejections_and_capture_metrics(self):
+        """
+        Verifies:
+        1. Rows with schema errors, zero amounts, or invalid dates are logged to filas_rechazadas.
+        2. Capture metrics: filas_candidatas, filas_extraidas, cobertura, tasa_rechazo.
+        3. Two identical purchases at chunk boundary without repeated reference are conserved intact.
+        """
+        filas_rechazadas = []
+        raw_llm_json = """
+        {
+            "transacciones": [
+                {"fecha": "2024-01-15", "concepto": "Valida 1", "importe": 100.0, "tipo": "cargo", "descripcion": "Valida 1"},
+                {"fecha": "2024-01-16", "concepto": "Valida 2", "importe": "250.00", "tipo": "abono", "descripcion": "Valida 2"},
+                {"fecha": "", "concepto": "Sin Fecha", "importe": 300.0, "tipo": "egreso", "descripcion": "Rechazo 1"},
+                {"fecha": "2024-01-17", "concepto": "Monto Cero", "importe": 0.0, "tipo": "egreso", "descripcion": "Rechazo 2"}
+            ]
+        }
+        """
+        txs = parse_strict_llm_json(raw_llm_json, filas_rechazadas=filas_rechazadas)
+        self.assertEqual(len(txs), 2)
+        self.assertEqual(len(filas_rechazadas), 2)
+
+        # Motivos auditados
+        motivos = {r["motivo"] for r in filas_rechazadas}
+        self.assertIn("fecha_invalida", motivos)
+        self.assertIn("importe_cero", motivos)
+
+        # Metric calculation
+        metrics = calcular_metricas_captura(
+            filas_candidatas=4,
+            filas_extraidas=len(txs),
+            filas_rechazadas=filas_rechazadas
+        )
+        self.assertEqual(metrics["filas_candidatas"], 4)
+        self.assertEqual(metrics["filas_extraidas"], 2)
+        self.assertEqual(metrics["cobertura"], 0.5)
+        self.assertEqual(metrics["tasa_rechazo"], 0.5)
+
+        # Boundary twins preservation
+        tx_tail = Transaccion(fecha="2024-01-20", concepto="Gasolinera", importe=500.0, descripcion="Carga Magna", tipo=TipoTransaccion.EGRESO)
+        tx_head = Transaccion(fecha="2024-01-20", concepto="Gasolinera", importe=500.0, descripcion="Carga Magna", tipo=TipoTransaccion.EGRESO)
+        tx_next = Transaccion(fecha="2024-01-21", concepto="Oxxo", importe=45.0, descripcion="Refresco", tipo=TipoTransaccion.EGRESO)
+
+        deduped = deduplicate_adjacent_chunks([tx_tail], [tx_head, tx_next])
+        self.assertEqual(len(deduped), 2, "Identical purchases at chunk boundary without reference must be preserved.")
+        self.assertEqual(deduped[0].importe, 500.0)
+        self.assertEqual(deduped[1].importe, 45.0)
+
+    def test_fase2_markdown_single_amount_and_confidence_scoring(self):
+        """
+        Fase 2 Validation in Data Validation Suite:
+        1. Single amount column table (| Fecha | Detalle | Importe | Saldo |).
+        2. Validate running balance chain and auto-confidence calculation.
+        3. Document state classification: low confidence rows trigger REVISAR.
+        4. compute_row_confidence penalty matrix and clamping.
+        """
+        # 1. Single amount column Markdown table
+        table_md = """
+| Fecha | Detalle | Importe | Saldo |
+|---|---|---|---|
+| 2024-06-01 | TRANSFERENCIA RECIBIDA | 3,000.00 | 8,000.00 |
+| 2024-06-02 | RETIRO CAJERO | -500.00 | 7,500.00 |
+| 2024-06-03 | PAGO DE SERVICIOS | 200.00 | 7,300.00 |
+"""
+        txs, unparsed, meta = parse_docling_markdown_tables(table_md, modo_contable="debito")
+        self.assertEqual(len(txs), 3)
+        self.assertEqual(txs[0].tipo, TipoTransaccion.INGRESO)
+        self.assertEqual(txs[0].importe, 3000.0)
+        self.assertEqual(txs[1].tipo, TipoTransaccion.EGRESO)
+        self.assertEqual(txs[1].importe, 500.0)
+        self.assertEqual(txs[2].tipo, TipoTransaccion.EGRESO)
+        self.assertEqual(txs[2].importe, 200.0)
+
+        # 2. Sequential balance chain validation (opening balance = 5000.0)
+        val_txs, chain_meta = validate_running_balance_chain(
+            txs,
+            saldo_inicial=5000.0,
+            modo_contable="debito"
+        )
+        self.assertEqual(chain_meta["cumplimiento_cadena_saldo"], 100.0)
+        self.assertEqual(chain_meta["filas_corregidas"], 0)
+        for tx in val_txs:
+            self.assertEqual(tx.confianza, 1.0)
+            self.assertEqual(tx.estado_revision, "VERIFICADO")
+
+        # 3. Document classification with low confidence rows
+        st_ok = clasificar_estado_documento(
+            cuadra=True,
+            modo_contable="debito",
+            cobertura=1.0,
+            filas_baja_confianza_count=0
+        )
+        self.assertEqual(st_ok, "VERIFICADO")
+
+        st_rev = clasificar_estado_documento(
+            cuadra=True,
+            modo_contable="debito",
+            cobertura=1.0,
+            filas_baja_confianza_count=1
+        )
+        self.assertEqual(st_rev, "REVISAR")
+
+        # 4. compute_row_confidence penalty matrix
+        # LLM origin: base 0.60
+        tx_llm = Transaccion(fecha="2024-06-01", concepto="Concepto", importe=100.0, descripcion="Desc", tipo=TipoTransaccion.EGRESO, origen="llm")
+        # LLM + cadena_ok (+0.15) = 0.75 -> VERIFICADO
+        self.assertEqual(compute_row_confidence(tx_llm, cadena_ok=True, acuerdo_senales=True, fecha_en_periodo=True), 0.75)
+        self.assertEqual(tx_llm.estado_revision, "VERIFICADO")
+
+        # LLM alone without balance column: 0.60 < 0.75 -> REVISAR
+        tx_llm_solo = Transaccion(fecha="2024-06-01", concepto="Concepto", importe=100.0, descripcion="Desc", tipo=TipoTransaccion.EGRESO, origen="llm")
+        self.assertEqual(compute_row_confidence(tx_llm_solo, cadena_ok=None, acuerdo_senales=True, fecha_en_periodo=True), 0.60)
+        self.assertEqual(tx_llm_solo.estado_revision, "REVISAR")
+
+        # Table row out of period: 0.85 - 0.20 = 0.65 < 0.75 -> REVISAR
+        tx_out_period = Transaccion(fecha="2024-12-31", concepto="Concepto", importe=100.0, descripcion="Desc", tipo=TipoTransaccion.EGRESO, origen="determinista_tabla")
+        self.assertEqual(compute_row_confidence(tx_out_period, cadena_ok=None, acuerdo_senales=True, fecha_en_periodo=False), 0.65)
+        self.assertEqual(tx_out_period.estado_revision, "REVISAR")
 
 
 if __name__ == "__main__":

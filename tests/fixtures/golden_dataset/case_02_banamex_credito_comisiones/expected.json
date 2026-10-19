@@ -1,0 +1,57 @@
+{
+  "case_id": "case_02_banamex_credito_comisiones",
+  "banco": "Citibanamex",
+  "tipo_documento": "pdf_digital",
+  "modo_esperado": "credito",
+  "saldo_inicial": 5000.0,
+  "saldo_final": 4200.0,
+  "total_cargos": 4200.0,
+  "total_abonos": 5000.0,
+  "movimientos_esperados": [
+    {
+      "fecha": "2024-04-05",
+      "concepto": "PAGO DE TARJETA SUCURSAL",
+      "importe": 5000.0,
+      "descripcion": "PAGO DE TARJETA SUCURSAL",
+      "tipo": "ingreso",
+      "saldo_renglon": 0.0,
+      "pagina": 1
+    },
+    {
+      "fecha": "2024-04-10",
+      "concepto": "COMPRA AMAZON MEXICO",
+      "importe": 2500.0,
+      "descripcion": "COMPRA AMAZON MEXICO",
+      "tipo": "egreso",
+      "saldo_renglon": 2500.0,
+      "pagina": 1
+    },
+    {
+      "fecha": "2024-04-15",
+      "concepto": "COMISION POR ANUALIDAD",
+      "importe": 1000.0,
+      "descripcion": "COMISION POR ANUALIDAD",
+      "tipo": "egreso",
+      "saldo_renglon": 3500.0,
+      "pagina": 1
+    },
+    {
+      "fecha": "2024-04-15",
+      "concepto": "IVA DE COMISION ANUALIDAD",
+      "importe": 160.0,
+      "descripcion": "IVA DE COMISION ANUALIDAD",
+      "tipo": "egreso",
+      "saldo_renglon": 3660.0,
+      "pagina": 1
+    },
+    {
+      "fecha": "2024-04-20",
+      "concepto": "INTERESES ORDINARIOS",
+      "importe": 540.0,
+      "descripcion": "INTERESES ORDINARIOS",
+      "tipo": "egreso",
+      "saldo_renglon": 4200.0,
+      "pagina": 1
+    }
+  ]
+}

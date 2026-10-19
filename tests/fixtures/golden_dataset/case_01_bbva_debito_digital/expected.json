@@ -1,0 +1,48 @@
+{
+  "case_id": "case_01_bbva_debito_digital",
+  "banco": "BBVA México",
+  "tipo_documento": "pdf_digital",
+  "modo_esperado": "debito",
+  "saldo_inicial": 15000.0,
+  "saldo_final": 22350.0,
+  "total_cargos": 7650.0,
+  "total_abonos": 15000.0,
+  "movimientos_esperados": [
+    {
+      "fecha": "2024-03-05",
+      "concepto": "DEPOSITO NOMINA EMPRESA SA",
+      "importe": 15000.0,
+      "descripcion": "DEPOSITO NOMINA EMPRESA SA",
+      "tipo": "ingreso",
+      "saldo_renglon": 30000.0,
+      "pagina": 1
+    },
+    {
+      "fecha": "2024-03-07",
+      "concepto": "PAGO DE SERVICIO CFE INTERNET",
+      "importe": 1250.0,
+      "descripcion": "PAGO DE SERVICIO CFE INTERNET",
+      "tipo": "egreso",
+      "saldo_renglon": 28750.0,
+      "pagina": 1
+    },
+    {
+      "fecha": "2024-03-10",
+      "concepto": "COMPRA SUPERMERCADO WALMART",
+      "importe": 3400.0,
+      "descripcion": "COMPRA SUPERMERCADO WALMART",
+      "tipo": "egreso",
+      "saldo_renglon": 25350.0,
+      "pagina": 1
+    },
+    {
+      "fecha": "2024-03-12",
+      "concepto": "RETIRO EN CAJERO AUTOMATICO BBVA",
+      "importe": 3000.0,
+      "descripcion": "RETIRO EN CAJERO AUTOMATICO BBVA",
+      "tipo": "egreso",
+      "saldo_renglon": 22350.0,
+      "pagina": 1
+    }
+  ]
+}

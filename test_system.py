@@ -10,14 +10,29 @@ Validates:
 """
 
 import os
+import json
 import tempfile
 import unittest
+from typing import Dict, Any, List, Tuple, Optional
 import pandas as pd
 from lxml import etree
 
-from models import Transaccion, TipoTransaccion, TransaccionesResponse, ReconciliacionResultado
+from models import (
+    Transaccion,
+    TipoTransaccion,
+    TransaccionesResponse,
+    ReconciliacionResultado,
+    clasificar_estado_documento,
+    GoldenCaseExpected,
+)
 from date_utils import normalize_spanish_date
-from parsers import parse_xml, extract_statement_balances
+from parsers import (
+    parse_xml,
+    extract_statement_balances,
+    infer_statement_mode,
+    parse_docling_markdown_tables,
+    validate_running_balance_chain,
+)
 from utils import (
     create_standard_dataframe,
     df_to_excel_bytes,
@@ -691,6 +706,428 @@ class TestFinancialExtractor(unittest.TestCase):
         balances_alt = extract_statement_balances(text_phrasing)
         self.assertEqual(balances_alt.get("saldo_inicial"), 1500.00)
         self.assertEqual(balances_alt.get("saldo_final"), 2800.75)
+
+    def test_extract_statement_balances_negative_and_credit_card(self):
+        """Verifies extraction of overdraft balances, accounting suffixes, multiline, and credit card headers."""
+        # 1. Overdraft with minus sign and parentheses
+        text_neg = "Saldo Inicial: -$1,500.00 | Saldo Final: ($2,350.25)"
+        bal_neg = extract_statement_balances(text_neg)
+        self.assertEqual(bal_neg.get("saldo_inicial"), -1500.00)
+        self.assertEqual(bal_neg.get("saldo_final"), -2350.25)
+
+        # 2. Accounting suffix (DR = debit/negative, CR = credit/positive)
+        text_dr = "Saldo Anterior: 4,200.50 DR \n Nuevo Saldo: 1,800.00 CR"
+        bal_dr = extract_statement_balances(text_dr)
+        self.assertEqual(bal_dr.get("saldo_inicial"), -4200.50)
+        self.assertEqual(bal_dr.get("saldo_final"), 1800.00)
+
+        # 3. Multiline extraction where amount appears on next line
+        text_multiline = "Saldo Inicial\n$1,500.00\nSaldo al Corte\n$3,750.50"
+        bal_multi = extract_statement_balances(text_multiline)
+        self.assertEqual(bal_multi.get("saldo_inicial"), 1500.00)
+        self.assertEqual(bal_multi.get("saldo_final"), 3750.50)
+
+        # 4. Credit card specific statement headers
+        text_cc = """
+        ESTADO DE CUENTA TARJETA DE CRÉDITO
+        Saldo Anterior: $ 5,400.00
+        Total Cargos: $ 3,100.00
+        Total Abonos: $ 2,500.00
+        Saldo Deudor Total: $ 6,000.00
+        Nuevo Saldo: $ 6,000.00
+        """
+        bal_cc = extract_statement_balances(text_cc)
+        self.assertEqual(bal_cc.get("saldo_anterior"), 5400.00)
+        self.assertEqual(bal_cc.get("saldo_inicial"), 5400.00)
+        self.assertEqual(bal_cc.get("total_cargos"), 3100.00)
+        self.assertEqual(bal_cc.get("total_abonos"), 2500.00)
+        self.assertEqual(bal_cc.get("saldo_deudor_total"), 6000.00)
+        self.assertEqual(bal_cc.get("saldo_final"), 6000.00)
+
+    def test_infer_statement_mode(self):
+        """Verifies deterministic inference of accounting mode ('debito', 'credito', 'ambiguo')."""
+        # Debit signals
+        text_deb = "Estado de cuenta de cheques. CLABE interbancaria: 012180001234567890. Saldo disponible al corte."
+        self.assertEqual(infer_statement_mode(text_deb), "debito")
+
+        # Credit card signals
+        text_cred = "Tarjeta de crédito Oro. Límite de crédito: $80,000.00. Pago para no generar intereses: $4,500.00."
+        self.assertEqual(infer_statement_mode(text_cred), "credito")
+
+        # Mathematical verification when text is neutral but summary_data fits debit
+        summary_deb = {
+            "saldo_inicial": 1000.0,
+            "saldo_final": 1800.0,
+            "total_abonos": 1000.0,
+            "total_cargos": 200.0,
+        }
+        self.assertEqual(infer_statement_mode("Resumen de movimientos", summary_deb), "debito")
+
+        # Mathematical verification when text is neutral but summary_data fits credit
+        summary_cred = {
+            "saldo_inicial": 5000.0,
+            "saldo_final": 4200.0,
+            "total_abonos": 1000.0,
+            "total_cargos": 200.0,
+        }
+        self.assertEqual(infer_statement_mode("Resumen de movimientos", summary_cred), "credito")
+
+        # Ambiguous when signals are missing or conflicting
+        self.assertEqual(infer_statement_mode("Documento bancario general sin detalles"), "ambiguo")
+
+    def test_inverted_cashflow_rejected_never_switches_to_credit(self):
+        """
+        Critical security test: verifies that a statement in debit mode where transactions
+        have inverted INGRESO/EGRESO types fails reconciliation with cuadra=False and NEVER
+        silently flips to credit mode to claim false reconciliation.
+        """
+        # Real situation: opening balance 10,000, closing 12,000.
+        # Genuine flow: INGRESO 3,000, EGRESO 1,000 (10000 + 3000 - 1000 = 12000).
+        # Inverted flow (e.g. LLM misclassification): INGRESO 1,000, EGRESO 3,000.
+        # In debit: 10000 + 1000 - 3000 = 8000 != 12000 (diff = 4000).
+        # In credit: 10000 - 1000 + 3000 = 12000 (diff = 0 -> FALSE POSITIVE IN PREVIOUS REPO!).
+        tx_inverted_1 = Transaccion(fecha="2024-05-10", concepto="Abono", importe=1000.0, descripcion="Deposito", tipo=TipoTransaccion.INGRESO)
+        tx_inverted_2 = Transaccion(fecha="2024-05-12", concepto="Cargo", importe=3000.0, descripcion="Retiro", tipo=TipoTransaccion.EGRESO)
+
+        debit_text = "Estado de cuenta Bancario. Cuenta de cheques. CLABE 012180000000000000."
+        res = reconcile_transactions(
+            [tx_inverted_1, tx_inverted_2],
+            saldo_inicial=10000.0,
+            saldo_final=12000.0,
+            text=debit_text
+        )
+
+        self.assertEqual(res.modo_contable, "debito")
+        self.assertFalse(res.cuadra)
+        self.assertFalse(res.conciliado)
+        self.assertEqual(res.diferencia, 4000.0)
+        self.assertNotEqual(res.modo_calculo, "credito")
+
+    def test_reconciliation_ambiguous_mode_never_reconciles(self):
+        """Verifies that an ambiguous statement mode forces cuadra=False even if arithmetic could match."""
+        tx1 = Transaccion(fecha="2024-05-10", concepto="Tx1", importe=500.0, descripcion="Desc", tipo=TipoTransaccion.INGRESO)
+        res = reconcile_transactions(
+            [tx1],
+            saldo_inicial=1000.0,
+            saldo_final=1500.0,
+            modo_contable="ambiguo"
+        )
+        self.assertFalse(res.cuadra)
+        self.assertFalse(res.conciliado)
+        self.assertEqual(res.modo_contable, "ambiguo")
+
+    def test_running_balance_chain_compliance(self):
+        """Verifies calculation of running balance chain compliance percentage."""
+        # 1. 100% compliant chain:
+        # Initial: 1000.0
+        # + Ingreso 500 -> saldo_renglon 1500.0 (OK)
+        # - Egreso 200 -> saldo_renglon 1300.0 (OK)
+        # - Egreso 300 -> saldo_renglon 1000.0 (OK)
+        tx1 = Transaccion(fecha="2024-06-01", concepto="Abono", importe=500.0, descripcion="A", tipo=TipoTransaccion.INGRESO, saldo_renglon=1500.0)
+        tx2 = Transaccion(fecha="2024-06-02", concepto="Cargo", importe=200.0, descripcion="B", tipo=TipoTransaccion.EGRESO, saldo_renglon=1300.0)
+        tx3 = Transaccion(fecha="2024-06-03", concepto="Cargo", importe=300.0, descripcion="C", tipo=TipoTransaccion.EGRESO, saldo_renglon=1000.0)
+
+        res = reconcile_transactions([tx1, tx2, tx3], saldo_inicial=1000.0, saldo_final=1000.0, modo_contable="debito")
+        self.assertTrue(res.cuadra)
+        self.assertEqual(res.filas_con_saldo, 3)
+        self.assertEqual(res.filas_cumplen_cadena, 3)
+        self.assertEqual(res.cumplimiento_cadena_saldo, 100.0)
+
+        # 2. Broken chain in one row:
+        # tx3 has corrupt saldo_renglon 800.0 instead of 1000.0
+        tx3_broken = Transaccion(fecha="2024-06-03", concepto="Cargo", importe=300.0, descripcion="C", tipo=TipoTransaccion.EGRESO, saldo_renglon=800.0)
+        res_broken = reconcile_transactions([tx1, tx2, tx3_broken], saldo_inicial=1000.0, saldo_final=1000.0, modo_contable="debito")
+        self.assertTrue(res_broken.cuadra)
+        self.assertEqual(res_broken.filas_con_saldo, 3)
+        self.assertEqual(res_broken.filas_cumplen_cadena, 2)
+        self.assertAlmostEqual(res_broken.cumplimiento_cadena_saldo, 66.67, places=1)
+
+    def test_clasificar_estado_documento(self):
+        """Verifies document classification into 'VERIFICADO', 'REVISAR', and 'RECHAZADO'."""
+        # 1. VERIFICADO: cuadra, debito, 100% cobertura, 0 rechazos
+        st1 = clasificar_estado_documento(cuadra=True, modo_contable="debito", cobertura=1.0, filas_rechazadas_count=0, tiene_saldos=True)
+        self.assertEqual(st1, "VERIFICADO")
+
+        # 2. REVISAR: cuadra but cobertura < 0.99
+        st2 = clasificar_estado_documento(cuadra=True, modo_contable="debito", cobertura=0.95, filas_rechazadas_count=0, tiene_saldos=True)
+        self.assertEqual(st2, "REVISAR")
+
+        # 3. REVISAR: cuadra but has rejected rows
+        st3 = clasificar_estado_documento(cuadra=True, modo_contable="credito", cobertura=1.0, filas_rechazadas_count=2, tiene_saldos=True)
+        self.assertEqual(st3, "REVISAR")
+
+        # 4. REVISAR: cuadra but no balances extracted from document
+        st4 = clasificar_estado_documento(cuadra=True, modo_contable="debito", cobertura=1.0, filas_rechazadas_count=0, tiene_saldos=False)
+        self.assertEqual(st4, "REVISAR")
+
+        # 5. RECHAZADO: does not balance
+        st5 = clasificar_estado_documento(cuadra=False, modo_contable="debito", cobertura=1.0, filas_rechazadas_count=0, tiene_saldos=True)
+        self.assertEqual(st5, "RECHAZADO")
+
+        # 6. RECHAZADO: ambiguous accounting mode
+        st6 = clasificar_estado_documento(cuadra=True, modo_contable="ambiguo", cobertura=1.0, filas_rechazadas_count=0, tiene_saldos=True)
+        self.assertEqual(st6, "RECHAZADO")
+
+    def test_evaluate_against_golden_unit(self):
+        """
+        Unit tests for evaluate_against_golden:
+        - Perfect extraction achieves 1.0 in precision, recall, F1, exactitud_tipo and falso_verificado == False.
+        - Inverted cashflow type is detected with exactitud_tipo < 1.0 and marks falso_verificado == True.
+        - Missing row causes recall < 1.0 and marks falso_verificado == True.
+        - Spurious row causes precision < 1.0 and marks falso_verificado == True.
+        """
+        golden = GoldenCaseExpected(
+            case_id="unit_test_case",
+            banco="Test Bank",
+            tipo_documento="pdf_digital",
+            modo_esperado="debito",
+            saldo_inicial=1000.0,
+            saldo_final=1900.0,
+            total_cargos=100.0,
+            total_abonos=1000.0,
+            movimientos_esperados=[
+                Transaccion(fecha="2024-01-01", concepto="Abono", importe=1000.0, descripcion="Abono", tipo=TipoTransaccion.INGRESO),
+                Transaccion(fecha="2024-01-02", concepto="Cargo", importe=100.0, descripcion="Cargo", tipo=TipoTransaccion.EGRESO),
+            ]
+        )
+
+        # 1. Perfect match
+        extracted_perfect = [
+            Transaccion(fecha="2024-01-01", concepto="Abono", importe=1000.0, descripcion="Abono", tipo=TipoTransaccion.INGRESO),
+            Transaccion(fecha="2024-01-02", concepto="Cargo", importe=100.0, descripcion="Cargo", tipo=TipoTransaccion.EGRESO),
+        ]
+        res_perf = evaluate_against_golden({"transacciones": extracted_perfect, "estado": "VERIFICADO"}, golden)
+        self.assertEqual(res_perf["precision_filas"], 1.0)
+        self.assertEqual(res_perf["recall_filas"], 1.0)
+        self.assertEqual(res_perf["f1_filas"], 1.0)
+        self.assertEqual(res_perf["exactitud_tipo"], 1.0)
+        self.assertFalse(res_perf["falso_verificado"])
+
+        # 2. Inverted cashflow type on cargo (classified as ingreso)
+        extracted_inverted = [
+            Transaccion(fecha="2024-01-01", concepto="Abono", importe=1000.0, descripcion="Abono", tipo=TipoTransaccion.INGRESO),
+            Transaccion(fecha="2024-01-02", concepto="Cargo", importe=100.0, descripcion="Cargo", tipo=TipoTransaccion.INGRESO),
+        ]
+        res_inv = evaluate_against_golden({"transacciones": extracted_inverted, "estado": "VERIFICADO"}, golden)
+        self.assertEqual(res_inv["exactitud_tipo"], 0.5)
+        self.assertTrue(res_inv["falso_verificado"], "Inverted cashflow must trigger falso_verificado if marked VERIFICADO")
+
+        # 3. Missing row (missing cargo)
+        extracted_missing = [
+            Transaccion(fecha="2024-01-01", concepto="Abono", importe=1000.0, descripcion="Abono", tipo=TipoTransaccion.INGRESO),
+        ]
+        res_miss = evaluate_against_golden({"transacciones": extracted_missing, "estado": "VERIFICADO"}, golden)
+        self.assertLess(res_miss["recall_filas"], 1.0)
+        self.assertTrue(res_miss["falso_verificado"])
+
+        # 4. Spurious extra row
+        extracted_spurious = [
+            Transaccion(fecha="2024-01-01", concepto="Abono", importe=1000.0, descripcion="Abono", tipo=TipoTransaccion.INGRESO),
+            Transaccion(fecha="2024-01-02", concepto="Cargo", importe=100.0, descripcion="Cargo", tipo=TipoTransaccion.EGRESO),
+            Transaccion(fecha="2024-01-03", concepto="Fantasma", importe=50.0, descripcion="Fantasma", tipo=TipoTransaccion.EGRESO),
+        ]
+        res_spur = evaluate_against_golden({"transacciones": extracted_spurious, "estado": "VERIFICADO"}, golden)
+        self.assertLess(res_spur["precision_filas"], 1.0)
+        self.assertTrue(res_spur["falso_verificado"])
+
+    def test_golden_dataset_regression(self):
+        """
+        Continuous Quality Gate across the Golden Dataset.
+        Iterates over all cases in tests/fixtures/golden_dataset/, extracts transactions,
+        validates the running balance chain, checks arithmetic reconciliation, and asserts:
+          - Tasa de falso_verificado == 0 (zero false-verified documents)
+          - f1_filas >= 0.99
+          - exactitud_tipo == 1.0
+        """
+        golden_dir = os.path.join(os.path.dirname(__file__), "tests", "fixtures", "golden_dataset")
+        self.assertTrue(os.path.exists(golden_dir), f"Golden dataset directory not found: {golden_dir}")
+
+        case_dirs = [
+            d for d in os.listdir(golden_dir)
+            if os.path.isdir(os.path.join(golden_dir, d)) and not d.startswith(".")
+        ]
+        self.assertGreaterEqual(len(case_dirs), 4, f"Expected at least 4 golden cases, found: {case_dirs}")
+
+        evaluation_results = []
+
+        for c_dir in sorted(case_dirs):
+            c_path = os.path.join(golden_dir, c_dir)
+            exp_file = os.path.join(c_path, "expected.json")
+            self.assertTrue(os.path.exists(exp_file), f"expected.json missing in {c_path}")
+
+            with open(exp_file, "r", encoding="utf-8") as f:
+                exp_data = json.load(f)
+            golden = GoldenCaseExpected(**exp_data)
+
+            doc_file = None
+            for fname in os.listdir(c_path):
+                if fname.startswith("documento"):
+                    doc_file = os.path.join(c_path, fname)
+                    break
+            self.assertIsNotNone(doc_file, f"Document file missing in {c_path}")
+
+            with open(doc_file, "r", encoding="utf-8") as f:
+                doc_text = f.read()
+
+            if golden.tipo_documento == "xml":
+                txs, _ = parse_xml(doc_file)
+            else:
+                txs, unparsed, meta = parse_docling_markdown_tables(
+                    doc_text,
+                    modo_contable=golden.modo_esperado
+                )
+
+            # Validate running balance chain
+            txs_val, chain_meta = validate_running_balance_chain(
+                txs,
+                saldo_inicial=golden.saldo_inicial,
+                modo_contable=golden.modo_esperado
+            )
+
+            # Reconcile transactions
+            recon = reconcile_transactions(
+                txs_val,
+                saldo_inicial=golden.saldo_inicial,
+                saldo_final=golden.saldo_final,
+                modo_contable=golden.modo_esperado,
+                text=doc_text
+            )
+
+            baja_conf = sum(1 for t in txs_val if getattr(t, "confianza", 1.0) < 0.75)
+            estado = clasificar_estado_documento(
+                cuadra=recon.cuadra,
+                modo_contable=golden.modo_esperado,
+                cobertura=1.0,
+                filas_rechazadas_count=0,
+                tiene_saldos=True,
+                filas_baja_confianza_count=baja_conf
+            )
+
+            res = {
+                "transacciones": txs_val,
+                "estado": estado,
+                "reconciliacion": recon
+            }
+
+            metrics = evaluate_against_golden(res, golden)
+            evaluation_results.append(metrics)
+
+            # Assert strict quality gates
+            self.assertFalse(
+                metrics["falso_verificado"],
+                f"Falso verificado detected for {golden.case_id}: F1={metrics['f1_filas']}, exactitud_tipo={metrics['exactitud_tipo']}"
+            )
+            self.assertGreaterEqual(
+                metrics["f1_filas"],
+                0.99,
+                f"F1 score below 0.99 for {golden.case_id}: {metrics['f1_filas']}"
+            )
+            self.assertEqual(
+                metrics["exactitud_tipo"],
+                1.0,
+                f"Exactitud de tipo below 1.0 for {golden.case_id}: {metrics['exactitud_tipo']}"
+            )
+            self.assertTrue(
+                recon.cuadra,
+                f"Balance does not reconcile for {golden.case_id}: diff={recon.diferencia}"
+            )
+
+
+def evaluate_against_golden(
+    extracted_result: Any,
+    golden_expected: GoldenCaseExpected
+) -> Dict[str, Any]:
+    """
+    Evalúa el resultado de extracción contra la verdad absoluta (GoldenCaseExpected).
+    Empareja movimientos extraídos vs esperados usando la clave compuesta (fecha_iso, round(importe, 2), tipo).
+
+    Métricas calculadas:
+      - precision_filas = TP / max(TP + FP, 1)
+      - recall_filas = TP / max(TP + FN, 1)
+      - f1_filas = 2 * (precision * recall) / max(precision + recall, 1e-9)
+      - exactitud_tipo: porcentaje de filas emparejadas por (fecha_iso, round(importe, 2)) cuyo tipo coincide exactamente.
+      - falso_verificado: bool: True si el sistema marcó el documento como 'VERIFICADO' pero f1_filas < 1.0 o exactitud_tipo < 1.0.
+    """
+    if isinstance(extracted_result, dict):
+        extracted_txs = extracted_result.get("transacciones", [])
+        estado = str(extracted_result.get("estado", "")).upper()
+    elif hasattr(extracted_result, "transacciones"):
+        extracted_txs = getattr(extracted_result, "transacciones", [])
+        estado = str(getattr(extracted_result, "estado", "")).upper()
+    elif isinstance(extracted_result, list):
+        extracted_txs = extracted_result
+        estado = "VERIFICADO"
+    else:
+        extracted_txs = []
+        estado = ""
+
+    expected_txs = list(golden_expected.movimientos_esperados)
+
+    def normalize_tx_tuple(tx: Any) -> Tuple[str, float, str]:
+        f = getattr(tx, "fecha", "")
+        f_iso = normalize_spanish_date(f) if f else ""
+        imp = round(abs(float(getattr(tx, "importe", 0.0))), 2)
+        t = getattr(tx, "tipo", "")
+        t_val = t.value if hasattr(t, "value") else str(t)
+        t_clean = "ingreso" if str(t_val).lower() in ("ingreso", "abono") else "egreso"
+        return (f_iso, imp, t_clean)
+
+    ext_norm = [normalize_tx_tuple(tx) for tx in extracted_txs]
+    exp_norm = [normalize_tx_tuple(tx) for tx in expected_txs]
+
+    # 1. Match candidates by (fecha_iso, importe) to evaluate exactitud_tipo
+    unmatched_exp_for_amount = list(exp_norm)
+    matched_amount_date = 0
+    matched_same_tipo = 0
+
+    for ext in ext_norm:
+        ext_date, ext_imp, ext_tipo = ext
+        match_idx = None
+        for i, exp in enumerate(unmatched_exp_for_amount):
+            if exp[0] == ext_date and exp[1] == ext_imp:
+                match_idx = i
+                break
+        if match_idx is not None:
+            matched_amount_date += 1
+            if unmatched_exp_for_amount[match_idx][2] == ext_tipo:
+                matched_same_tipo += 1
+            unmatched_exp_for_amount.pop(match_idx)
+
+    exactitud_tipo = round(matched_same_tipo / max(matched_amount_date, 1), 4) if matched_amount_date > 0 else (1.0 if not exp_norm else 0.0)
+
+    # 2. Strict matching on composite key (fecha_iso, importe, tipo) for TP, FP, FN
+    unmatched_exp_strict = list(exp_norm)
+    tp = 0
+    for ext in ext_norm:
+        if ext in unmatched_exp_strict:
+            tp += 1
+            unmatched_exp_strict.remove(ext)
+
+    fp = len(ext_norm) - tp
+    fn = len(exp_norm) - tp
+
+    precision = round(tp / max(tp + fp, 1), 4)
+    recall = round(tp / max(tp + fn, 1), 4)
+    if precision + recall > 0:
+        f1 = round((2.0 * precision * recall) / (precision + recall), 4)
+    else:
+        f1 = 0.0 if exp_norm else 1.0
+
+    # falso_verificado: True si el sistema marcó 'VERIFICADO' pero f1_filas < 1.0 o exactitud_tipo < 1.0
+    falso_verificado = bool(estado == "VERIFICADO" and (f1 < 1.0 or exactitud_tipo < 1.0))
+
+    return {
+        "case_id": golden_expected.case_id,
+        "precision_filas": precision,
+        "recall_filas": recall,
+        "f1_filas": f1,
+        "exactitud_tipo": exactitud_tipo,
+        "falso_verificado": falso_verificado,
+        "tp": tp,
+        "fp": fp,
+        "fn": fn,
+        "estado_documento": estado,
+    }
 
 
 if __name__ == "__main__":

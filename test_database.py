@@ -13,6 +13,7 @@ Validates:
 
 import os
 import gc
+import sqlite3
 import tempfile
 import unittest
 import pandas as pd
@@ -37,6 +38,7 @@ from database import (
     mark_checkpoint_interrupted,
     clear_batch_checkpoint,
     get_db_connection,
+    get_filas_rechazadas,
     _INITIALIZED_DBS,
 )
 
@@ -650,6 +652,180 @@ class TestDatabaseLayer(unittest.TestCase):
         cp_done = get_batch_checkpoint(batch_id, db_path=self.db_path)
         self.assertEqual(cp_done["estado"], "completed")
         self.assertEqual(len(cp_done["archivos_completados"]), 3)
+
+    def test_filas_rechazadas_persistence_and_query(self):
+        """Verifies persistence and retrieval of audited rejected rows in database."""
+        fname = "estado_rechazos.pdf"
+        fhash = compute_file_hash(b"content with rejected rows")
+        txs = [
+            Transaccion(fecha="2024-08-01", concepto="Compra", importe=250.0, descripcion="Oxxo", tipo=TipoTransaccion.EGRESO)
+        ]
+        rechazos = [
+            {
+                "linea_origen": "| 15-Ene-2024 | Fila corrupta | NaN |",
+                "datos_crudos": {"fecha": "15-Ene-2024", "raw": "invalid"},
+                "motivo": "validacion_esquema",
+                "detalle_error": "Input should be a valid number"
+            },
+            {
+                "linea_origen": "Total comisiones: $0.00",
+                "datos_crudos": "Total comisiones: $0.00",
+                "motivo": "importe_cero",
+                "detalle_error": "Importe 0.0 descartado"
+            }
+        ]
+
+        archivo_id = save_processed_transactions(
+            filename=fname,
+            file_hash=fhash,
+            file_type="pdf",
+            transactions=txs,
+            filas_rechazadas=rechazos,
+            db_path=self.db_path
+        )
+
+        # Retrieve by file id
+        saved_rechazos = get_filas_rechazadas(archivo_id, db_path=self.db_path)
+        self.assertEqual(len(saved_rechazos), 2)
+        self.assertEqual(saved_rechazos[0]["linea_origen"], "| 15-Ene-2024 | Fila corrupta | NaN |")
+        self.assertEqual(saved_rechazos[0]["motivo"], "validacion_esquema")
+        self.assertIn("valid number", saved_rechazos[0]["detalle_error"])
+        self.assertEqual(saved_rechazos[1]["motivo"], "importe_cero")
+
+        # Global query retrieves them as well
+        global_rechazos = get_filas_rechazadas(None, db_path=self.db_path)
+        self.assertGreaterEqual(len(global_rechazos), 2)
+
+    def test_new_schema_columns_and_cascade_on_filas_rechazadas(self):
+        """Verifies new Phase 3 columns in archivos_procesados and transacciones, and cascade delete."""
+        fname = "estado_auditado.pdf"
+        fhash = compute_file_hash(b"audited binary content")
+        tx = Transaccion(
+            fecha="2024-08-10",
+            concepto="Pago Cliente A",
+            importe=15000.0,
+            descripcion="Honorarios",
+            tipo=TipoTransaccion.INGRESO,
+            confianza=0.99,
+            origen="llm",
+            linea_origen="| 10-Ago-2024 | Pago Cliente A | $15,000.00 |",
+            saldo_renglon=25000.0,
+            estado_revision="pendiente"
+        )
+        rechazos = [
+            {
+                "linea_origen": "Fila descartada",
+                "datos_crudos": "raw",
+                "motivo": "fecha_invalida",
+                "detalle_error": "Fecha fuera de rango"
+            }
+        ]
+
+        archivo_id = save_processed_transactions(
+            filename=fname,
+            file_hash=fhash,
+            file_type="pdf",
+            transactions=[tx],
+            estado_conciliacion="VERIFICADO",
+            modo_contable="debito",
+            cobertura=0.995,
+            metricas_json='{"cobertura": 0.995, "filas_extraidas": 1}',
+            filas_rechazadas=rechazos,
+            db_path=self.db_path
+        )
+
+        # 1. Verify archivos_procesados fields
+        rec = check_file_processed(fname, fhash, db_path=self.db_path)
+        self.assertIsNotNone(rec)
+        self.assertEqual(rec["estado_conciliacion"], "VERIFICADO")
+        self.assertEqual(rec["modo_contable"], "debito")
+        self.assertAlmostEqual(rec["cobertura"], 0.995)
+        self.assertIn("filas_extraidas", rec["metricas_json"])
+
+        distinct_files = get_distinct_files(db_path=self.db_path)
+        self.assertEqual(len(distinct_files), 1)
+        self.assertEqual(distinct_files[0]["estado_conciliacion"], "VERIFICADO")
+        self.assertEqual(distinct_files[0]["modo_contable"], "debito")
+        self.assertAlmostEqual(distinct_files[0]["cobertura"], 0.995)
+
+        # 2. Verify transacciones fields
+        df_txs = query_transactions(archivo_id=archivo_id, db_path=self.db_path)
+        self.assertEqual(len(df_txs), 1)
+        self.assertAlmostEqual(df_txs.iloc[0]["confianza"], 0.99)
+        self.assertEqual(df_txs.iloc[0]["origen"], "llm")
+        self.assertEqual(df_txs.iloc[0]["linea_origen"], "| 10-Ago-2024 | Pago Cliente A | $15,000.00 |")
+        self.assertAlmostEqual(df_txs.iloc[0]["saldo_renglon"], 25000.0)
+        self.assertEqual(df_txs.iloc[0]["estado_revision"], "pendiente")
+
+        # 3. Verify ON DELETE CASCADE on filas_rechazadas
+        self.assertEqual(len(get_filas_rechazadas(archivo_id, db_path=self.db_path)), 1)
+        deleted = delete_processed_file(archivo_id, db_path=self.db_path)
+        self.assertTrue(deleted)
+        self.assertEqual(len(get_filas_rechazadas(archivo_id, db_path=self.db_path)), 0)
+
+    def test_legacy_db_safe_alter_table_migration(self):
+        """Verifies that an older SQLite schema seamlessly upgrades with ALTER TABLE ADD COLUMN without errors."""
+        legacy_dir = tempfile.TemporaryDirectory()
+        try:
+            legacy_db = os.path.join(legacy_dir.name, "legacy.db")
+            # Create old schema directly
+            conn = sqlite3.connect(legacy_db)
+            conn.execute("""
+                CREATE TABLE archivos_procesados (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    nombre_archivo TEXT NOT NULL,
+                    tipo_archivo TEXT NOT NULL,
+                    hash_sha256 TEXT NOT NULL,
+                    total_transacciones INTEGER NOT NULL,
+                    total_ingresos REAL NOT NULL,
+                    total_egresos REAL NOT NULL,
+                    fecha_procesamiento TIMESTAMP NOT NULL,
+                    rango_fecha_inicio TEXT,
+                    rango_fecha_fin TEXT,
+                    saldo_inicial REAL,
+                    saldo_final REAL,
+                    diferencia_conciliacion REAL,
+                    conciliado INTEGER,
+                    ruta_archivo TEXT,
+                    tamano_bytes INTEGER
+                );
+            """)
+            conn.execute("""
+                CREATE TABLE transacciones (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    archivo_id INTEGER NOT NULL,
+                    fecha TEXT NOT NULL,
+                    concepto TEXT NOT NULL,
+                    importe REAL NOT NULL,
+                    descripcion TEXT,
+                    tipo TEXT NOT NULL
+                );
+            """)
+            conn.commit()
+            conn.close()
+
+            # Now run init_db which must apply safe ALTER TABLE migrations
+            init_db(legacy_db)
+
+            # Check that new columns exist
+            with db_session(legacy_db) as c:
+                cols_archivos = [r[1] for r in c.execute("PRAGMA table_info(archivos_procesados);").fetchall()]
+                self.assertIn("estado_conciliacion", cols_archivos)
+                self.assertIn("modo_contable", cols_archivos)
+                self.assertIn("cobertura", cols_archivos)
+                self.assertIn("metricas_json", cols_archivos)
+
+                cols_tx = [r[1] for r in c.execute("PRAGMA table_info(transacciones);").fetchall()]
+                self.assertIn("confianza", cols_tx)
+                self.assertIn("origen", cols_tx)
+                self.assertIn("linea_origen", cols_tx)
+                self.assertIn("saldo_renglon", cols_tx)
+                self.assertIn("estado_revision", cols_tx)
+
+                tables = [r[0] for r in c.execute("SELECT name FROM sqlite_master WHERE type='table';").fetchall()]
+                self.assertIn("filas_rechazadas", tables)
+        finally:
+            legacy_dir.cleanup()
 
 
 if __name__ == "__main__":

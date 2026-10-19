@@ -148,11 +148,52 @@ class StageStopwatch:
             self.total_elapsed = round(sum(self.stage_timings.values()), 2)
         return self.total_elapsed
 
+    def record_custom_metric(self, metric_name: str, value: Any) -> None:
+        if not hasattr(self, "custom_metrics"):
+            self.custom_metrics = {}
+        self.custom_metrics[metric_name] = value
+
     def to_dict(self) -> Dict[str, Any]:
-        return {
+        data = {
             "stages": {k: round(v, 2) for k, v in self.stage_timings.items()},
             "total_seconds": round(self.total_elapsed, 2),
         }
+        if hasattr(self, "custom_metrics") and self.custom_metrics:
+            data["custom_metrics"] = self.custom_metrics
+        return data
+
+
+_HIGH_RES_METRICS: Dict[str, Any] = {}
+
+
+def record_high_res_verification(
+    elapsed_seconds: float,
+    memory_mb: float,
+    pages_count: int,
+    stage_name: str = "high_res_verification_pass"
+) -> Dict[str, Any]:
+    """
+    Registra el tiempo de ejecución y el consumo de memoria de la segunda pasada
+    selectiva de alta resolución bajo la métrica 'high_res_verification_pass'.
+    """
+    record = {
+        "metric_name": stage_name,
+        "elapsed_seconds": round(float(elapsed_seconds), 2),
+        "memory_mb": round(float(memory_mb), 2),
+        "pages_count": int(pages_count),
+        "timestamp": time.time(),
+    }
+    _HIGH_RES_METRICS[stage_name] = record
+    return record
+
+
+def get_high_res_verification_telemetry(
+    stage_name: str = "high_res_verification_pass"
+) -> Optional[Dict[str, Any]]:
+    """
+    Retorna la telemetría registrada para la pasada de verificación en alta resolución.
+    """
+    return _HIGH_RES_METRICS.get(stage_name)
 
 
 def render_telemetry_expander(
