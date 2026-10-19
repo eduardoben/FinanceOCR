@@ -13,6 +13,7 @@ import time
 import functools
 import threading
 import multiprocessing
+import json
 from typing import List, Tuple, Optional, Dict, Any
 from PIL import Image
 from lxml import etree

@@ -9,6 +9,7 @@ export or copy directly into Excel with standard formatting.
 
 import os
 import sys
+import json
 import tempfile
 import multiprocessing
 from datetime import datetime
